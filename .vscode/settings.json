@@ -1,0 +1,10 @@
+{
+  "format_on_save": true,
+  "editor.formatOnSave": true,
+  "editor.codeActionsOnSave": {
+    "source.organizeImports": "explicit"
+  },
+  "python.languageServer": "Pylance",
+  "ruff.checkers": ["src"],
+  "ruff.args": ["--config", "pyproject.toml"]
+}
