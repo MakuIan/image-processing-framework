@@ -4,7 +4,12 @@
   "editor.codeActionsOnSave": {
     "source.organizeImports": "explicit"
   },
-  "python.languageServer": "Pylance",
-  "ruff.checkers": ["src"],
-  "ruff.args": ["--config", "pyproject.toml"]
+  "python.languageServer": "Jedi",
+  "ruff.checkers": [
+    "src"
+  ],
+  "ruff.args": [
+    "--config",
+    "pyproject.toml"
+  ]
 }
