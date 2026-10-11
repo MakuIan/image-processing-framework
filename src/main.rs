@@ -1,112 +1,262 @@
-mod base;
-mod evaluator;
-mod filters;
-mod frame;
-mod io;
-mod pipeline;
-mod video_sink;
-mod video_source;
+﻿use std::path::{Path, PathBuf};
 
-use image::{Rgb, RgbImage};
+use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
+use image_processing_framework::{
+    calculate_psnr, calculate_ssim, generate_diff_map, FilterConfig, ImageSink, ImageSource,
+    Pipeline, Sink, Source, VideoEncoder, VideoSink, VideoSource,
+};
 
-use base::{Sink, Source};
-use evaluator::{calculate_psnr, calculate_ssim, generate_diff_map};
-use filters::{BilateralFilter, BlurFilter, GaussianNoiseFilter};
-use io::{ImageSink, ImageSource};
-use pipeline::Pipeline;
-use video_sink::VideoSink;
-use video_source::VideoSource;
+// --- Standard-Konstanten fuer Pfade und CLI ---
+const ASSETS_DIR: &str = "assets";
+const OUTPUT_DIR: &str = "output";
+const DEFAULT_FILE_STEM: &str = "output";
+const DEFAULT_IMAGE_EXT: &str = "png";
+const PROCESSED_SUFFIX: &str = "_processed";
+const DIFF_HEATMAP_SUFFIX: &str = "_diff_heatmap";
+const DEFAULT_ENCODER: &str = "auto";
 
-/// Erstellt ein Schachbrett-Muster-Bild
-fn create_checkerboard(width: u32, height: u32, tile_size: u32) -> RgbImage {
-    let mut img = RgbImage::new(width, height);
-    for y in 0..height {
-        for x in 0..width {
-            let row = y / tile_size;
-            let col = x / tile_size;
-            if (row + col) % 2 == 0 {
-                img.put_pixel(x, y, Rgb([255, 255, 255]));
-            } else {
-                img.put_pixel(x, y, Rgb([128, 128, 128]));
-            }
-        }
-    }
-    img
+/// Image Processing Framework – Bild- und Video-Verarbeitung über die CLI
+#[derive(Parser)]
+#[command(name = "image-processing-framework", version, about)]
+struct Cli {
+    /// Eingabedatei (Bild: png/jpg/jpeg, Video: mp4/avi/mov/mkv/webm)
+    input: PathBuf,
+
+    /// Ausgabepfad (standardmäßig automatisch in 'assets/output/' generiert)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Gaussian-Noise-Filter anwenden
+    #[arg(long)]
+    noise: bool,
+
+    /// Stärke des Rauschens (Standard: 15.0)
+    #[arg(long)]
+    noise_sigma: Option<f64>,
+
+    /// Mittelwert des Rauschens (Standard: 0.0)
+    #[arg(long)]
+    noise_mean: Option<f64>,
+
+    /// Blur-Filter (Weichzeichner) anwenden
+    #[arg(long)]
+    blur: bool,
+
+    /// Stärke der Weichzeichnung / Sigma (Standard: 1.0)
+    #[arg(long)]
+    blur_sigma: Option<f32>,
+
+    /// Bilateral-Filter (Kantenerhaltender Glätter) anwenden
+    #[arg(long)]
+    bilateral: bool,
+
+    /// Bilateral-Filter Radius in Pixeln (Standard: 3)
+    #[arg(long)]
+    bilateral_radius: Option<i32>,
+
+    /// Bilateral-Filter Farbtoleranz / Sigma Color (Standard: 50.0)
+    #[arg(long)]
+    bilateral_color: Option<f64>,
+
+    /// Bilateral-Filter Raumdistanz / Sigma Space (Standard: 50.0)
+    #[arg(long)]
+    bilateral_space: Option<f64>,
+
+    /// Video-Encoder für FFmpeg (auto, amf, nvenc, qsv, cpu)
+    #[arg(long, default_value = DEFAULT_ENCODER)]
+    encoder: String,
+
+    /// Maximale Anzahl Frames verarbeiten (optional zum Testen)
+    #[arg(long)]
+    max_frames: Option<usize>,
+
+    /// GPU-Compute-Shader (wgpu) für Filter verwenden (AMD/Nvidia/Intel)
+    #[arg(long)]
+    gpu: bool,
 }
 
-/// Führt das Bild-Beispiel durch (originaler Code)
-fn run_image_pipeline() {
-    println!("=== Bild-Pipeline ===\n");
+/// Klassifiziert die Eingabedatei anhand ihrer Dateiendung
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputKind {
+    Image,
+    Video,
+    Unknown,
+}
 
-    // Step 1: Create synthetic checkerboard image (512x512)
-    let tile_size = 64u32;
-    let original_image = create_checkerboard(512, 512, tile_size);
-    let original_path = "test_input.png";
+fn detect_input_kind(path: &Path) -> InputKind {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
 
-    println!("Step 1: Creating checkerboard image ({}x{})", 512, 512);
-    if let Err(e) = original_image.save(original_path) {
-        eprintln!("Error saving original image: {}", e);
-        return;
+    match ext.as_deref() {
+        Some("png") | Some("jpg") | Some("jpeg") => InputKind::Image,
+        Some("mp4") | Some("avi") | Some("mov") | Some("mkv") | Some("webm") => InputKind::Video,
+        _ => InputKind::Unknown,
     }
-    println!("  Saved to: {}", original_path);
+}
 
-    // Step 2: Create ImageSource
-    println!("\nStep 2: Creating ImageSource...");
-    let mut source = ImageSource::new(original_path);
+/// Generiert den Ausgabepfad standardmäßig nach `assets/output/<stem>_processed.<ext>`
+/// Falls der Input nicht in assets/input liegt, bleibt der Zielordner assets/output.
+fn auto_output_path(input_path: &Path) -> PathBuf {
+    let stem = input_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(DEFAULT_FILE_STEM);
+    let ext = input_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or(DEFAULT_IMAGE_EXT);
 
-    let original_frame = match source.next_frame() {
-        Some(frame) => frame,
-        None => {
-            eprintln!("Error loading image!");
-            return;
+    PathBuf::from(ASSETS_DIR)
+        .join(OUTPUT_DIR)
+        .join(format!("{}{}.{}", stem, PROCESSED_SUFFIX, ext))
+}
+
+/// Ermittelt den Pfad für die Diff-Heatmap passend zum Ausgabepfad
+fn diff_heatmap_path(output_path: &Path) -> PathBuf {
+    let stem = output_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("diff")
+        .trim_end_matches(PROCESSED_SUFFIX);
+    let ext = output_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or(DEFAULT_IMAGE_EXT);
+
+    let parent = output_path.parent().unwrap_or(Path::new("."));
+    parent.join(format!("{}{}.{}", stem, DIFF_HEATMAP_SUFFIX, ext))
+}
+
+/// Baut die Pipeline anhand der gesetzten CLI-Filter-Flags auf
+fn build_pipeline(cli: &Cli) -> Pipeline {
+    if cli.gpu {
+        println!("  Modus: GPU-Beschleunigung aktiv (wgpu Compute-Shader auf Vulkan/DX12)");
+    } else {
+        println!("  Modus: CPU-Verarbeitung (Rayon Multithreading)");
+    }
+
+    let use_noise = cli.noise || cli.noise_sigma.is_some() || cli.noise_mean.is_some();
+    let use_bilateral = cli.bilateral
+        || cli.bilateral_radius.is_some()
+        || cli.bilateral_color.is_some()
+        || cli.bilateral_space.is_some();
+    let use_blur = cli.blur || cli.blur_sigma.is_some();
+
+    let any_filter_set = use_noise || use_bilateral || use_blur;
+
+    let filter_configs: Vec<FilterConfig> = if any_filter_set {
+        let mut configs = Vec::new();
+
+        if use_noise {
+            configs.push(FilterConfig::GaussianNoise {
+                mean: cli.noise_mean.unwrap_or(FilterConfig::DEFAULT_NOISE_MEAN),
+                sigma: cli.noise_sigma.unwrap_or(FilterConfig::DEFAULT_NOISE_SIGMA),
+            });
         }
+        if use_bilateral {
+            configs.push(FilterConfig::Bilateral {
+                radius: cli.bilateral_radius.unwrap_or(FilterConfig::DEFAULT_BILATERAL_RADIUS),
+                sigma_color: cli.bilateral_color.unwrap_or(FilterConfig::DEFAULT_BILATERAL_COLOR),
+                sigma_space: cli.bilateral_space.unwrap_or(FilterConfig::DEFAULT_BILATERAL_SPACE),
+            });
+        }
+        if use_blur {
+            configs.push(FilterConfig::Blur {
+                sigma: cli.blur_sigma.unwrap_or(FilterConfig::DEFAULT_BLUR_SIGMA),
+            });
+        }
+
+        configs
+    } else {
+        println!(
+            "  Keine Filter-Flags gesetzt – verwende Standard-Pipeline (noise + bilateral + blur)."
+        );
+        FilterConfig::default_pipeline()
     };
+
+    let mut pipeline = Pipeline::new();
+    for config in filter_configs {
+        pipeline = pipeline.add_boxed_filter(config.instantiate(cli.gpu));
+    }
+    pipeline
+}
+
+/// Führt die Bild-Pipeline für eine einzelne Eingabedatei durch
+fn run_image_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let input_path = &cli.input;
+
+    if !input_path.is_file() {
+        eprintln!("Fehler: Eingabedatei {:?} nicht gefunden!", input_path);
+        return Err("Input file not found".into());
+    }
+
+    let output_path = match &cli.output {
+        Some(p) => p.clone(),
+        None => auto_output_path(input_path),
+    };
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    println!("=== Bild-Pipeline ===\n");
+    println!("Input:  {:?}", input_path);
+    println!("Output: {:?}", output_path);
+
+    // Step 1: Original-Bild über ImageSource laden
+    println!("Step 1: Bild laden via ImageSource...");
+    let mut source = ImageSource::new(input_path);
+    let original_frame = source
+        .next_frame()
+        .ok_or_else(|| format!("Konnte Bild nicht laden: {:?}", input_path))?;
     source.release();
+
     println!(
-        "  Loaded: {}x{}",
+        "  Geladen: {}x{} (Index: {}, Timestamp: {:.2}s)",
         original_frame.width(),
-        original_frame.height()
+        original_frame.height(),
+        original_frame.index(),
+        original_frame.timestamp()
     );
 
-    // Step 3: Build Pipeline with filters
-    println!("\nStep 3: Building Pipeline...");
-    let mut pipeline = Pipeline::new();
+    // Step 2: Pipeline anhand der CLI-Flags aufbauen
+    println!("\nStep 2: Pipeline aufbauen...");
+    let pipeline = build_pipeline(cli);
 
-    println!("  Adding GaussianNoiseFilter(mean=0.0, sigma=30.0)...");
-    pipeline = pipeline.add_filter(GaussianNoiseFilter::new(0.0, 30.0));
-
-    println!("  Adding BilateralFilter(radius=3, sigma_color=75.0, sigma_space=75.0)...");
-    let bilateral = BilateralFilter::new(3, 75.0, 75.0);
-    pipeline = pipeline.add_filter(bilateral);
-
-    println!("  Adding BlurFilter(sigma=1.5)...");
-    pipeline = pipeline.add_filter(BlurFilter::new(1.5));
-
-    // Step 4: Run Pipeline and save result - pass sink directly as &mut K
-    println!("\nStep 4: Running Pipeline...");
-    let mut pipeline_source = ImageSource::new(original_path);
-    let mut sink = ImageSink::new("test_output.png");
-
-    let processed_frames = pipeline.run(&mut pipeline_source, &mut sink);
-    pipeline_source.release();
-
-    if !processed_frames.is_empty() {
-        let processed_frame = &processed_frames[0];
-        println!(
-            "  Processed frame: {}x{}",
-            processed_frame.width(),
-            processed_frame.height()
-        );
-        println!("  Saved to: test_output.png");
-    } else {
-        eprintln!("ERROR: No frames were processed!");
-        return;
+    for (idx, filter) in pipeline.filters().iter().enumerate() {
+        println!("  Filter {}: {}", idx + 1, filter.name());
     }
 
-    // Step 5: Calculate quality metrics (PSNR, SSIM)
-    println!("\nStep 5: Calculating quality metrics...");
+    // Step 3: Pipeline ausführen
+    println!("\nStep 3: Pipeline ausführen...");
+    let processed_frame = pipeline.process_frame(original_frame.clone());
 
-    let psnr = calculate_psnr(&original_frame, &processed_frames[0]);
+    // Metadaten der verarbeiteten Frames anzeigen
+    println!("  Angewandte Filter aus Frame-Metadaten:");
+    for (key, value) in processed_frame.metadata() {
+        println!("    {}: {}", key, value);
+    }
+
+    // Step 4: Ergebnis über ImageSink speichern
+    println!("\nStep 4: Speichere Ergebnis via ImageSink...");
+    let mut sink = ImageSink::new(&output_path);
+    sink.write(&processed_frame)?;
+    sink.release();
+    println!("  Verarbeitetes Bild: {:?}", output_path);
+
+    // Diff-Heatmap berechnen und passend zum Ausgabepfad speichern
+    let diff_path = diff_heatmap_path(&output_path);
+    let diff_frame = generate_diff_map(&original_frame, &processed_frame);
+    let mut diff_sink = ImageSink::new(&diff_path);
+    diff_sink.write(&diff_frame)?;
+    diff_sink.release();
+    println!("  Diff-Heatmap: {:?}", diff_path);
+
+    // Step 5: Qualitätsmetriken berechnen
+    println!("\nStep 5: Qualitätsmetriken berechnen...");
+    let psnr = calculate_psnr(&original_frame, &processed_frame);
     println!(
         "  PSNR: {:.2} dB",
         if psnr.is_infinite() {
@@ -116,196 +266,138 @@ fn run_image_pipeline() {
         }
     );
 
-    let ssim = calculate_ssim(&original_frame, &processed_frames[0]);
+    let ssim = calculate_ssim(&original_frame, &processed_frame);
     println!("  SSIM: {:.4}", ssim);
 
-    // Step 6: Generate difference heatmap
-    println!("\nStep 6: Generating difference heatmap...");
-    let diff_image = generate_diff_map(&original_frame, &processed_frames[0]);
-    if let Err(e) = diff_image.data().save("diff_heatmap.png") {
-        eprintln!("Error saving diff image: {}", e);
-    } else {
-        println!("  Saved to: diff_heatmap.png");
-    }
-
-    // Step 7: Summary
-    println!("\n=== Bild-Pipeline Summary ===");
-    println!(
-        "Original image: {}x{}",
-        original_frame.width(),
-        original_frame.height()
-    );
-    println!("Pipeline filters: Gaussian Noise -> Bilateral Filter -> Blur");
-    println!(
-        "PSNR: {:.2} dB",
-        if psnr.is_infinite() {
-            f64::INFINITY
-        } else {
-            psnr
-        }
-    );
-    println!("SSIM: {:.4}", ssim);
-    println!("\nOutput files:");
-    println!("  - test_input.png (original checkerboard)");
-    println!("  - test_output.png (processed image)");
-    println!("  - diff_heatmap.png (difference visualization)");
-}
-
-/// Führt das Video-Beispiel durch mit VideoSource und VideoSink
-fn run_video_pipeline() -> Result<(), Box<dyn std::error::Error>> {
-    let video_input_path = "test_video.mp4";
-    let video_output_path = "output_video.mp4";
-
-    println!("=== Video-Pipeline ===\n");
-
-    // Check if video file exists, otherwise use fallback to image
-    if !std::path::Path::new(video_input_path).exists() {
-        eprintln!("Hinweis: {} nicht gefunden.", video_input_path);
-        eprintln!("Verwende Bild-Benchmark als Fallback.");
-        return run_image_pipeline_with_video_sink();
-    }
-
-    println!("Step 1: Creating VideoSource for '{}'", video_input_path);
-
-    // Erstelle VideoSource mit ggfs. FPS von Video ermitteln
-    let mut source = match VideoSource::new(video_input_path) {
-        Ok(source) => source,
-        Err(e) => {
-            eprintln!("Fehler beim Starten von VideoSource: {}", e);
-            return Err("VideoSource konnte nicht erstellt werden".into());
-        }
-    };
-
-    // Hole Metadaten aus dem ersten Frame
-    let first_frame = match source.next_frame() {
-        Some(f) => f,
-        None => {
-            eprintln!("Fehler: Kein Frame lesbar!");
-            return Err("Kein Frame von VideoSource verfügbar".into());
-        }
-    };
-
-    println!(
-        "  Videogröße: {}x{}",
-        first_frame.width(),
-        first_frame.height()
-    );
-    println!("  FPS: aus ffprobe ermittelt");
-
-    // Erstelle VideoSink und setze Auflösung
-    let mut sink = VideoSink::new(video_output_path, 25.0);
-    sink.set_width(first_frame.width());
-    sink.set_height(first_frame.height());
-
-    // Step 2: Erstelle Pipeline mit Filtern
-    println!("\nStep 2: Building Pipeline...");
-    let mut pipeline = Pipeline::new();
-
-    println!("  Adding GaussianNoiseFilter(mean=0.0, sigma=15.0)...");
-    pipeline = pipeline.add_filter(GaussianNoiseFilter::new(0.0, 15.0));
-
-    println!("  Adding BlurFilter(sigma=3.0)...");
-    pipeline = pipeline.add_filter(BlurFilter::new(3.0));
-
-    // Step 3: Führe Pipeline aus (verarbeite alle Frames)
-    println!("\nStep 3: Running Pipeline...");
-
-    let processed_frames = pipeline.run(&mut source, &mut sink);
-
-    println!("  {} Frame(s) verarbeitet", processed_frames.len());
-    source.release();
-    sink.release();
-
-    // Step 4: Ausgabe-Informationen
-    println!("\nStep 4: Video-Pipeline abgeschlossen!");
-    if std::path::Path::new(video_output_path).exists() {
-        let metadata = std::fs::metadata(video_output_path)?;
-        println!("  Output-Datei: {}", video_output_path);
-        println!("  Grösse: {} Bytes", metadata.len());
-    }
-
-    // Schritt 5: Erstelle Original (ohne Filter) Ausgabe
-    println!("\nStep 5: Creating original output (no filters)...");
-    let mut source = match VideoSource::new(video_input_path) {
-        Ok(source) => source,
-        Err(e) => return Err(e.into()),
-    };
-
-    // Erhalte Metadaten erneut für Original-Videostreaming
-    if let Some(first_frame) = source.next_frame() {
-        let mut sink = VideoSink::new("original_video.mp4", 25.0);
-        sink.set_width(first_frame.width());
-        sink.set_height(first_frame.height());
-
-        println!("  Running source-to-sink without pipeline (original video)...");
-        pipeline.run(&mut source, &mut sink);
-        source.release();
-        sink.release();
-    }
-
-    println!("\n=== Video-Pipeline Summary ===");
-    println!("Input: {}", video_input_path);
-    println!("Processed Output: {}", video_output_path);
-    println!("Original Output: original_video.mp4");
-    println!("Filters: Gaussian Noise (sigma=15) -> Blur (sigma=3)");
-    println!("Codec: H.264 libx264, Format: YUV420P");
-
+    println!("\n=== Bild-Pipeline erfolgreich abgeschlossen ===");
     Ok(())
 }
 
-/// Fallback-Modus wenn keine Videodatei vorhanden
-fn run_image_pipeline_with_video_sink() -> Result<(), Box<dyn std::error::Error>> {
-    let original_image = create_checkerboard(1920, 1080, 64);
-    let temp_path = "test_temp.png";
+/// Führt die Video-Pipeline für eine einzelne Eingabedatei durch
+fn run_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let input_path = &cli.input;
 
-    println!("=== VideoSink Fallback Mode ===\n");
-
-    println!("Step 1: Creating test image for video sink testing...");
-    if let Err(e) = original_image.save(temp_path) {
-        eprintln!("Error saving test image: {}", e);
-        return Err("Cannot create test image".into());
+    if !input_path.is_file() {
+        eprintln!("Fehler: Eingabedatei {:?} nicht gefunden!", input_path);
+        return Err("Input file not found".into());
     }
 
-    // Verwende ImageSource anstelle VideoSource
-    let mut source = ImageSource::new(temp_path);
-    let frame = source.next_frame().ok_or("No image available")?;
+    let output_path = match &cli.output {
+        Some(p) => p.clone(),
+        None => auto_output_path(input_path),
+    };
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
 
-    println!("Test Image: {}x{}", frame.width(), frame.height());
+    println!("=== Video-Pipeline ===\n");
+    println!("Input:  {:?}", input_path);
+    println!("Output: {:?}", output_path);
 
-    // Erstelle VideoSink mit Auflösung
-    let mut sink = VideoSink::new("output_video.mp4", 1.0);
-    sink.set_width(frame.width());
-    sink.set_height(frame.height());
+    println!("Step 1: Initialisiere VideoSource...");
+    let mut source = VideoSource::new(input_path)?;
+    println!(
+        "  Video-Eigenschaften: {}x{} @ {:.2} FPS{}",
+        source.width(),
+        source.height(),
+        source.fps(),
+        if let Some(total) = source.total_frames() {
+            format!(" (ca. {} Frames)", total)
+        } else {
+            String::new()
+        }
+    );
 
-    println!("\nStep 2: Testing VideoSink with test image...");
+    let encoder = VideoEncoder::from_str_loose(&cli.encoder);
+    let mut sink = VideoSink::new(&output_path, source.fps() as f32).with_encoder(encoder);
 
-    // Schreibe Bild als Frame aus
-    sink.write(&frame)?;
+    println!("\nStep 2: Pipeline aufbauen...");
+    let mut pipeline = build_pipeline(cli);
 
-    // Release um FFmpeg zu beenden
+    for (idx, filter) in pipeline.filters().iter().enumerate() {
+        println!("  Filter {}: {}", idx + 1, filter.name());
+    }
+
+    println!("\nStep 3: Streaming-Verarbeitung ausführen...");
+
+    let total_frames = source.total_frames();
+    let display_total = match (total_frames, cli.max_frames) {
+        (Some(total), Some(limit)) => Some(total.min(limit)),
+        (Some(total), None) => Some(total),
+        (None, Some(limit)) => Some(limit),
+        (None, None) => None,
+    };
+
+    let pb = if let Some(total) = display_total {
+        let bar = ProgressBar::new(total as u64);
+        bar.set_draw_target(indicatif::ProgressDrawTarget::stdout_with_hz(5));
+        bar.set_style(
+            ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] [{bar:30.cyan/blue}] {pos}/{len} ({per_sec}, ETA {eta})")
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("#>-"),
+        );
+        bar
+    } else {
+        let bar = ProgressBar::new_spinner();
+        bar.set_draw_target(indicatif::ProgressDrawTarget::stdout_with_hz(5));
+        bar.set_style(
+            ProgressStyle::default_spinner()
+                .template("[{elapsed_precise}] {pos} Frames ({per_sec})")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        bar
+    };
+
+    let pb_clone = pb.clone();
+    let processed_count = pipeline.run_with_progress(
+        &mut source,
+        &mut sink,
+        cli.max_frames,
+        move |_count| {
+            pb_clone.inc(1);
+        },
+    )?;
+
+    pb.finish_and_clear();
+    println!("  {} Frame(s) erfolgreich verarbeitet!", processed_count);
+
     sink.release();
 
-    if std::path::Path::new("output_video.mp4").exists() {
-        let metadata = std::fs::metadata("output_video.mp4")?;
-        println!("VideoSink test successful!");
-        println!("Output: output_video.mp4 ({} bytes)", metadata.len());
-    } else {
-        eprintln!("VideoSink test warning: file not created (ffmpeg might not be installed)");
+    if output_path.is_file() {
+        let meta = std::fs::metadata(&output_path)?;
+        println!("  Ausgabedatei: {:?} ({} Bytes)", output_path, meta.len());
     }
 
+    println!("\n=== Video-Pipeline erfolgreich abgeschlossen ===");
     Ok(())
 }
 
 fn main() {
-    println!("=== Image Processing Framework Demo ===\n");
+    let cli = Cli::parse();
 
-    // ---- Bild-Beispiel (originaler Code) ----
-    run_image_pipeline();
-
-    // ---- Video-Beispiel (neuer Code) ----
-    if let Err(e) = run_video_pipeline() {
-        eprintln!("Video-Pipeline failed: {}", e);
-        eprintln!("Hint: Make sure 'ffmpeg' and 'ffprobe' are installed.");
-        return;
+    // Dateityp anhand der Dateiendung bestimmen
+    match detect_input_kind(&cli.input) {
+        InputKind::Image => {
+            if let Err(e) = run_image_pipeline(&cli) {
+                eprintln!("Bild-Pipeline fehlgeschlagen: {}", e);
+                std::process::exit(1);
+            }
+        }
+        InputKind::Video => {
+            if let Err(e) = run_video_pipeline(&cli) {
+                eprintln!("Video-Pipeline fehlgeschlagen: {}", e);
+                eprintln!("Hinweis: Stelle sicher, dass 'ffmpeg' und 'ffprobe' installiert sind.");
+                std::process::exit(1);
+            }
+        }
+        InputKind::Unknown => {
+            eprintln!(
+                "Fehler: Unbekannte Dateiendung für {:?}. \
+                 Unterstützt werden: png, jpg, jpeg (Bild) oder mp4, avi, mov, mkv, webm (Video).",
+                cli.input
+            );
+            std::process::exit(1);
+        }
     }
 }

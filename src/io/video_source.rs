@@ -1,4 +1,4 @@
-use crate::base::Source;
+﻿use crate::base::Source;
 use crate::frame::Frame;
 use image::RgbImage;
 use serde_json::Value;
@@ -13,9 +13,6 @@ pub struct VideoSource {
     /// Handle zum FFmpeg-Prozess
     process: Option<VideoProcess>,
 
-    /// Puffer für rohe Daten aus stdout
-    buffer: Vec<u8>,
-
     /// Aktuelle Frame-Index
     frame_index: usize,
 
@@ -27,6 +24,9 @@ pub struct VideoSource {
 
     /// FPS Wert (aus ffprobe)
     fps: f64,
+
+    /// Gesamtzahl Frames (sofern aus Metadaten ermittelbar)
+    total_frames: Option<usize>,
 }
 
 /// Wrapper um den FFmpeg-Prozess
@@ -38,40 +38,29 @@ struct VideoProcess {
 impl Source for VideoSource {
     fn next_frame(&mut self) -> Option<Frame> {
         let bytes_per_frame = (self.width * self.height * 3) as usize;
+        let process = self.process.as_mut()?;
 
-        // Fülle Puffer aus stdout wenn nötig
-        while self.buffer.len() < bytes_per_frame {
-            match &mut self.process {
-                Some(process) => {
-                    match process.stdout.read_to_end(&mut self.buffer) {
-                        Ok(0) => return None, // EOF erreicht
-                        Ok(_) => {
-                            if self.buffer.len() < bytes_per_frame {
-                                return None; // Nicht genug Daten für einen Frame
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Fehler beim Lesen von FFmpeg stdout: {}", e);
-                            return None;
-                        }
-                    }
-                }
-                None => return None,
+        let mut frame_data = vec![0u8; bytes_per_frame];
+        match process.stdout.read_exact(&mut frame_data) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return None;
+            }
+            Err(e) => {
+                eprintln!("Fehler beim Lesen von FFmpeg stdout: {}", e);
+                return None;
             }
         }
-
-        // Lese genau bytes_per_frame Bytes für einen Frame
-        let frame_data = self.buffer.drain(..bytes_per_frame).collect::<Vec<u8>>();
 
         // Erstelle RgbImage aus rohen Daten mit RgbImage::from_raw
         let img = RgbImage::from_raw(self.width, self.height, frame_data)?;
 
         // Berechne Timestamp: frame_index * (1/fps)
         let timestamp = (self.frame_index as f64) / self.fps;
-
+        let index = self.frame_index;
         self.frame_index += 1;
 
-        Some(Frame::new(img, self.frame_index - 1, timestamp))
+        Some(Frame::new(img, index, timestamp))
     }
 
     fn release(&mut self) {
@@ -79,27 +68,22 @@ impl Source for VideoSource {
             process.child.kill().ok();
             process.child.wait().ok();
         }
-        self.buffer.clear();
     }
 }
 
 impl VideoSource {
     /// Erstellt eine neue VideoSource für die gegebene Videodatei.
     pub fn new<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<Self> {
-        let path = path.as_ref().display().to_string();
+        let path_str = path.as_ref().display().to_string();
 
-        // Zuerst metadaten mit ffprobe ermitteln (width, height, fps)
-        let (width, height, fps) = VideoSource::get_video_metadata(&path)?;
+        // Zuerst Metadaten mit ffprobe ermitteln (width, height, fps, total_frames)
+        let (width, height, fps, total_frames) = VideoSource::get_video_metadata(&path_str)?;
 
-        // FFmpeg-Process starten:
-        // -i INPUT : Eingabedatei laden
-        // -f rawvideo : rohes Videoformat ausgeben
-        // -pix_fmt rgb24 : RGB24 Pixelformat (3 Bytes pro Pixel)
-        // - : stdout als Output
+        // FFmpeg-Prozess starten
         let mut child = Command::new("ffmpeg")
-            .args(["-i", &path, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .args(["-i", &path_str, "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null()) // stderr ignorieren
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|e| {
                 std::io::Error::new(
@@ -118,18 +102,38 @@ impl VideoSource {
         let process = VideoProcess { child, stdout };
 
         Ok(Self {
-            path,
+            path: path_str,
             process: Some(process),
-            buffer: Vec::new(),
             frame_index: 0,
             width,
             height,
             fps,
+            total_frames,
         })
     }
 
-    /// Ermittelt Video-Metadaten mit ffprobe (Breite, Höhe, FPS).
-    fn get_video_metadata(path: &str) -> std::io::Result<(u32, u32, f64)> {
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn fps(&self) -> f64 {
+        self.fps
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn total_frames(&self) -> Option<usize> {
+        self.total_frames
+    }
+
+    /// Ermittelt Video-Metadaten mit ffprobe (Breite, Höhe, FPS, Gesamtzahl Frames).
+    fn get_video_metadata(path: &str) -> std::io::Result<(u32, u32, f64, Option<usize>)> {
         let output = Command::new("ffprobe")
             .args([
                 path,
@@ -176,7 +180,6 @@ impl VideoSource {
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Keine Höhe"))?
             as u32;
 
-        // FPS aus r_frame_rate (z.B. "30000/1001" -> 30000/1001.0)
         let fps_str = video_stream
             .get("r_frame_rate")
             .and_then(|v| v.as_str())
@@ -196,6 +199,18 @@ impl VideoSource {
             })?
         };
 
-        Ok((width, height, fps))
+        let total_frames: Option<usize> = video_stream
+            .get("nb_frames")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<usize>().ok())
+            .or_else(|| {
+                let duration = video_stream
+                    .get("duration")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())?;
+                Some((duration * fps).round() as usize)
+            });
+
+        Ok((width, height, fps, total_frames))
     }
 }

@@ -1,7 +1,8 @@
 use crate::frame::Frame;
-use image::{GrayImage, Luma};
+use image::GrayImage;
 use image::{Rgb, RgbImage};
 use imageproc::filter::gaussian_blur_f32;
+use rayon::prelude::*;
 
 pub fn calculate_psnr(original: &Frame, processed: &Frame) -> f64 {
     if original.width() != processed.width() || original.height() != processed.height() {
@@ -10,21 +11,24 @@ pub fn calculate_psnr(original: &Frame, processed: &Frame) -> f64 {
 
     let width = original.width();
     let height = original.height();
-    let num_pixels = (width as u32 * height as u32) as f64;
+    if width == 0 || height == 0 {
+        return 0.0;
+    }
+
+    let num_pixels = (width * height) as f64;
     let total_channels = num_pixels * 3.0;
 
-    let mut sum_squared_diff: f64 = 0.0;
+    let orig_raw = original.data().as_raw();
+    let proc_raw = processed.data().as_raw();
 
-    for y in 0..height {
-        for x in 0..width {
-            let orig_pixel = original.get_pixel(x, y);
-            let proc_pixel = processed.get_pixel(x, y);
-
-            sum_squared_diff += (orig_pixel[0] as f64 - proc_pixel[0] as f64).powi(2);
-            sum_squared_diff += (orig_pixel[1] as f64 - proc_pixel[1] as f64).powi(2);
-            sum_squared_diff += (orig_pixel[2] as f64 - proc_pixel[2] as f64).powi(2);
-        }
-    }
+    let sum_squared_diff: f64 = orig_raw
+        .par_iter()
+        .zip(proc_raw.par_iter())
+        .map(|(&o, &p)| {
+            let diff = o as f64 - p as f64;
+            diff * diff
+        })
+        .sum();
 
     let mse = sum_squared_diff / total_channels;
 
@@ -32,7 +36,7 @@ pub fn calculate_psnr(original: &Frame, processed: &Frame) -> f64 {
         return f64::INFINITY;
     }
 
-    10.0 * (f64::from(255.0).powi(2) / mse).log10()
+    10.0 * (255.0f64.powi(2) / mse).log10()
 }
 
 pub fn calculate_ssim(original: &Frame, processed: &Frame) -> f64 {
@@ -40,65 +44,56 @@ pub fn calculate_ssim(original: &Frame, processed: &Frame) -> f64 {
         return 0.0;
     }
 
-    // RgbImage in Graustufen konvertieren (über get_pixel aus dem Frame)
+    let width = original.width();
+    let height = original.height();
+    if width == 0 || height == 0 {
+        return 0.0;
+    }
+
+    // Convert to grayscale
     let gray1 = rgb_to_gray(original);
     let gray2 = rgb_to_gray(processed);
 
-    // Gauß-Glättung anwenden
+    // Apply Gaussian blur
     let sigma = 1.5f32;
     let blurred1 = gaussian_blur_f32(&gray1, sigma);
     let blurred2 = gaussian_blur_f32(&gray2, sigma);
 
-    let width = original.width() as usize;
-    let height = original.height() as usize;
+    let total_pixels = (width * height) as f64;
 
-    // Mittelwerte berechnen
-    let mut sum1: f64 = 0.0;
-    let mut sum2: f64 = 0.0;
-    for y in 0..height {
-        for x in 0..width {
-            let p1 = blurred1.get_pixel(x as u32, y as u32);
-            let p2 = blurred2.get_pixel(x as u32, y as u32);
-            sum1 += (*p1)[0] as f64;
-            sum2 += (*p2)[0] as f64;
-        }
-    }
-    let mu1 = sum1 / (width as f64 * height as f64);
-    let mu2 = sum2 / (width as f64 * height as f64);
+    let raw1 = blurred1.as_raw();
+    let raw2 = blurred2.as_raw();
 
-    // Varianz und Kovarianz berechnen
-    let mut var_sum: f64 = 0.0;
-    let mut cov_sum: f64 = 0.0;
-    for y in 0..height {
-        for x in 0..width {
-            let p1 = blurred1.get_pixel(x as u32, y as u32);
-            let p2 = blurred2.get_pixel(x as u32, y as u32);
+    // Calculate means using parallel sum
+    let sum1: f64 = raw1.par_iter().map(|&p| p as f64).sum();
+    let sum2: f64 = raw2.par_iter().map(|&p| p as f64).sum();
+    let mu1 = sum1 / total_pixels;
+    let mu2 = sum2 / total_pixels;
 
-            let d1 = (*p1)[0] as f64 - mu1;
-            let d2 = (*p2)[0] as f64 - mu2;
+    // Calculate variances and covariance in parallel
+    let (var1_sum, var2_sum, cov_sum): (f64, f64, f64) = raw1
+        .par_iter()
+        .zip(raw2.par_iter())
+        .map(|(&p1, &p2)| {
+            let d1 = p1 as f64 - mu1;
+            let d2 = p2 as f64 - mu2;
+            (d1 * d1, d2 * d2, d1 * d2)
+        })
+        .reduce(
+            || (0.0, 0.0, 0.0),
+            |acc, item| (acc.0 + item.0, acc.1 + item.1, acc.2 + item.2),
+        );
 
-            var_sum += d1 * d1;
-            cov_sum += d1 * d2;
-        }
-    }
+    let sigma1_sq = var1_sum / total_pixels;
+    let sigma2_sq = var2_sum / total_pixels;
+    let sigma12 = cov_sum / total_pixels;
 
-    let sigma12_sq = if width * height > 0 {
-        var_sum / (width as f64 * height as f64)
-    } else {
-        0.0
-    };
-    let sigma12_cov = if width * height > 0 {
-        cov_sum / (width as f64 * height as f64)
-    } else {
-        0.0
-    };
+    // Standard SSIM stability constants
+    const C1: f64 = (0.01 * 255.0) * (0.01 * 255.0);
+    const C2: f64 = (0.03 * 255.0) * (0.03 * 255.0);
 
-    // SSIM berechnen
-    const C1: f64 = (0.01 * 255.0f64) * (0.01 * 255.0f64);
-    const C2: f64 = (0.03 * 255.0f64) * (0.03 * 255.0f64);
-
-    let numerator = (2.0 * mu1 * mu2 + C1) * (2.0 * sigma12_cov + C2);
-    let denominator = (mu1 * mu1 + mu2 * mu2 + C1) * (sigma12_sq + C2);
+    let numerator = (2.0 * mu1 * mu2 + C1) * (2.0 * sigma12 + C2);
+    let denominator = (mu1 * mu1 + mu2 * mu2 + C1) * (sigma1_sq + sigma2_sq + C2);
 
     if denominator == 0.0 {
         return 0.0;
@@ -108,104 +103,137 @@ pub fn calculate_ssim(original: &Frame, processed: &Frame) -> f64 {
 }
 
 fn rgb_to_gray(img: &Frame) -> GrayImage {
-    let width = img.width() as usize;
-    let height = img.height() as usize;
-    let mut gray = GrayImage::new(width as u32, height as u32);
-
-    for y in 0..height {
-        for x in 0..width {
-            let rgb = img.get_pixel(x as u32, y as u32);
-            // Luminance formula
-            let luma: f32 = 0.299 * rgb[0] as f32 + 0.587 * rgb[1] as f32 + 0.114 * rgb[2] as f32;
-            gray.put_pixel(x as u32, y as u32, Luma([((luma * 255.0f32) as u8)]));
-        }
+    let width = img.width();
+    let height = img.height();
+    if width == 0 || height == 0 {
+        return GrayImage::new(width, height);
     }
 
-    gray
+    let orig_raw = img.data().as_raw();
+    let stride = (width * 3) as usize;
+    let mut gray_raw = vec![0u8; (width * height) as usize];
+
+    gray_raw
+        .par_chunks_mut(width as usize)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let in_row = &orig_raw[y * stride..(y + 1) * stride];
+            for x in 0..width as usize {
+                let r = in_row[x * 3] as f32;
+                let g = in_row[x * 3 + 1] as f32;
+                let b = in_row[x * 3 + 2] as f32;
+                let luma: f32 = 0.299 * r + 0.587 * g + 0.114 * b;
+                row[x] = luma.round().clamp(0.0, 255.0) as u8;
+            }
+        });
+
+    GrayImage::from_raw(width, height, gray_raw).unwrap()
 }
 
 pub fn generate_diff_map(original: &Frame, processed: &Frame) -> Frame {
     let width = original.width();
     let height = original.height();
-    let mut result = RgbImage::new(width, height);
-
-    let mut max_diff = 0f64;
-
-    for y in 0..height {
-        for x in 0..width {
-            let orig_pixel = original.get_pixel(x, y);
-            let proc_pixel = processed.get_pixel(x, y);
-
-            let diff_r = (orig_pixel[0] as f64 - proc_pixel[0] as f64).abs();
-            let diff_g = (orig_pixel[1] as f64 - proc_pixel[1] as f64).abs();
-            let diff_b = (orig_pixel[2] as f64 - proc_pixel[2] as f64).abs();
-            let avg_diff = (diff_r + diff_g + diff_b) / 3.0;
-
-            result.put_pixel(x, y, Rgb([avg_diff as u8, avg_diff as u8, avg_diff as u8]));
-
-            if avg_diff > max_diff {
-                max_diff = avg_diff;
-            }
-        }
+    if width == 0 || height == 0 {
+        return Frame::default();
     }
 
-    let mut diff_map = RgbImage::new(width, height);
+    let orig_raw = original.data().as_raw();
+    let proc_raw = processed.data().as_raw();
+    let total_pixels = (width * height) as usize;
 
-    for y in 0..height {
-        for x in 0..width {
-            let orig_pixel = original.get_pixel(x, y);
-            let proc_pixel = processed.get_pixel(x, y);
+    // Parallel pass 1: compute channel differences
+    let diff_values: Vec<f64> = (0..total_pixels)
+        .into_par_iter()
+        .map(|idx| {
+            let base = idx * 3;
+            let diff_r = (orig_raw[base] as f64 - proc_raw[base] as f64).abs();
+            let diff_g = (orig_raw[base + 1] as f64 - proc_raw[base + 1] as f64).abs();
+            let diff_b = (orig_raw[base + 2] as f64 - proc_raw[base + 2] as f64).abs();
+            (diff_r + diff_g + diff_b) / 3.0
+        })
+        .collect();
 
-            let diff_r = (orig_pixel[0] as f64 - proc_pixel[0] as f64).abs();
-            let diff_g = (orig_pixel[1] as f64 - proc_pixel[1] as f64).abs();
-            let diff_b = (orig_pixel[2] as f64 - proc_pixel[2] as f64).abs();
-            let avg_diff = (diff_r + diff_g + diff_b) / 3.0;
+    let max_diff = diff_values.par_iter().copied().reduce(|| 0.0f64, f64::max);
 
+    // Parallel pass 2: normalize differences into jet pseudocolor map
+    let mut diff_raw = vec![0u8; (width * height * 3) as usize];
+
+    diff_raw
+        .par_chunks_mut(3)
+        .zip(diff_values.par_iter())
+        .for_each(|(pixel, &avg_diff)| {
             let normalized = if max_diff > 0.0 {
-                (avg_diff / max_diff * 255.0f64) as u8
+                (avg_diff / max_diff * 255.0).clamp(0.0, 255.0) as u8
             } else {
                 0u8
             };
 
             let jet_color = jet_pseudocolor(normalized);
-            diff_map.put_pixel(x, y, jet_color);
-        }
-    }
+            pixel[0] = jet_color[0];
+            pixel[1] = jet_color[1];
+            pixel[2] = jet_color[2];
+        });
 
-    Frame::new(diff_map, 0, 0.0)
+    let diff_map = RgbImage::from_raw(width, height, diff_raw).unwrap();
+    processed.clone_with_data(diff_map)
 }
 
 fn jet_pseudocolor(value: u8) -> Rgb<u8> {
     let v = value as f64;
-    if v < 51.0f64 {
+    if v < 51.0 {
         Rgb([
-            (v / 51.0f64 * 255.0f64) as u8,
-            (v / 255.0f64 * 51.0f64) as u8,
-            ((255.0f64 - v) / 255.0f64 * 255.0f64) as u8,
+            (v / 51.0 * 255.0) as u8,
+            (v / 255.0 * 51.0) as u8,
+            ((255.0 - v) / 255.0 * 255.0) as u8,
         ])
-    } else if v < 102.0f64 {
+    } else if v < 102.0 {
         Rgb([
             255u8,
-            ((v - 51.0f64) / 51.0f64 * 255.0f64) as u8,
-            (((255.0f64 - (v - 51.0f64)) / 51.0f64 * 51.0f64) as u8),
+            ((v - 51.0) / 51.0 * 255.0) as u8,
+            (((255.0 - (v - 51.0)) / 51.0 * 51.0) as u8),
         ])
-    } else if v < 153.0f64 {
+    } else if v < 153.0 {
         Rgb([
-            (((255.0f64 - (v - 102.0f64)) / 51.0f64 * 255.0f64) as u8),
+            (((255.0 - (v - 102.0)) / 51.0 * 255.0) as u8),
             255u8,
-            ((v - 102.0f64) / 51.0f64 * 255.0f64) as u8,
+            ((v - 102.0) / 51.0 * 255.0) as u8,
         ])
-    } else if v < 204.0f64 {
+    } else if v < 204.0 {
         Rgb([
-            ((v - 153.0f64) / 51.0f64 * 255.0f64) as u8,
-            (((255.0f64 - (v - 153.0f64)) / 51.0f64 * 51.0f64) as u8),
+            ((v - 153.0) / 51.0 * 255.0) as u8,
+            (((255.0 - (v - 153.0)) / 51.0 * 51.0) as u8),
             255u8,
         ])
     } else {
         Rgb([
             0u8,
-            ((v - 204.0f64) / 51.0f64 * 255.0f64) as u8,
-            ((v - 204.0f64) / 102.0f64 * 255.0f64) as u8,
+            ((v - 204.0) / 51.0 * 255.0) as u8,
+            ((v - 204.0) / 102.0 * 255.0) as u8,
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_psnr_identical() {
+        let img = RgbImage::new(16, 16);
+        let f1 = Frame::new(img.clone(), 0, 0.0);
+        let f2 = Frame::new(img, 0, 0.0);
+        assert_eq!(calculate_psnr(&f1, &f2), f64::INFINITY);
+    }
+
+    #[test]
+    fn test_ssim_identical() {
+        let mut img = RgbImage::new(16, 16);
+        for p in img.pixels_mut() {
+            *p = Rgb([120, 130, 140]);
+        }
+        let f1 = Frame::new(img.clone(), 0, 0.0);
+        let f2 = Frame::new(img, 0, 0.0);
+        let ssim = calculate_ssim(&f1, &f2);
+        assert!((ssim - 1.0).abs() < 1e-4);
     }
 }
