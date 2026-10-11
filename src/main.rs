@@ -1,11 +1,11 @@
 ﻿use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressStyle};
 use image_processing_framework::{
-    calculate_psnr, calculate_ssim, generate_diff_map, FilterConfig, ImageSink, ImageSource,
-    Pipeline, Sink, Source, VideoEncoder, VideoSink, VideoSource,
+    FilterConfig, ImageSink, ImageSource, Pipeline, Sink, Source, VideoEncoder, VideoSink,
+    VideoSource, calculate_psnr, calculate_ssim, generate_diff_map,
 };
+use indicatif::{ProgressBar, ProgressStyle};
 
 // --- Standard-Konstanten fuer Pfade und CLI ---
 const ASSETS_DIR: &str = "assets";
@@ -158,9 +158,15 @@ fn build_pipeline(cli: &Cli) -> Pipeline {
         }
         if use_bilateral {
             configs.push(FilterConfig::Bilateral {
-                radius: cli.bilateral_radius.unwrap_or(FilterConfig::DEFAULT_BILATERAL_RADIUS),
-                sigma_color: cli.bilateral_color.unwrap_or(FilterConfig::DEFAULT_BILATERAL_COLOR),
-                sigma_space: cli.bilateral_space.unwrap_or(FilterConfig::DEFAULT_BILATERAL_SPACE),
+                radius: cli
+                    .bilateral_radius
+                    .unwrap_or(FilterConfig::DEFAULT_BILATERAL_RADIUS),
+                sigma_color: cli
+                    .bilateral_color
+                    .unwrap_or(FilterConfig::DEFAULT_BILATERAL_COLOR),
+                sigma_space: cli
+                    .bilateral_space
+                    .unwrap_or(FilterConfig::DEFAULT_BILATERAL_SPACE),
             });
         }
         if use_blur {
@@ -328,19 +334,23 @@ fn run_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         (None, None) => None,
     };
 
+    let hz = 5;
+
     let pb = if let Some(total) = display_total {
         let bar = ProgressBar::new(total as u64);
-        bar.set_draw_target(indicatif::ProgressDrawTarget::stdout_with_hz(5));
+        bar.set_draw_target(indicatif::ProgressDrawTarget::stdout_with_hz(hz));
         bar.set_style(
             ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] [{bar:30.cyan/blue}] {pos}/{len} ({per_sec}, ETA {eta})")
+                .template(
+                    "[{elapsed_precise}] [{bar:30.cyan/blue}] {pos}/{len} ({per_sec}, ETA {eta})",
+                )
                 .unwrap_or_else(|_| ProgressStyle::default_bar())
                 .progress_chars("#>-"),
         );
         bar
     } else {
         let bar = ProgressBar::new_spinner();
-        bar.set_draw_target(indicatif::ProgressDrawTarget::stdout_with_hz(5));
+        bar.set_draw_target(indicatif::ProgressDrawTarget::stdout_with_hz(hz));
         bar.set_style(
             ProgressStyle::default_spinner()
                 .template("[{elapsed_precise}] {pos} Frames ({per_sec})")
@@ -350,14 +360,10 @@ fn run_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let pb_clone = pb.clone();
-    let processed_count = pipeline.run_with_progress(
-        &mut source,
-        &mut sink,
-        cli.max_frames,
-        move |_count| {
+    let processed_count =
+        pipeline.run_with_progress(&mut source, &mut sink, cli.max_frames, move |_count| {
             pb_clone.inc(1);
-        },
-    )?;
+        })?;
 
     pb.finish_and_clear();
     println!("  {} Frame(s) erfolgreich verarbeitet!", processed_count);
