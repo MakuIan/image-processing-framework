@@ -26,14 +26,27 @@ impl Pipeline {
         &self.filters
     }
 
-    pub fn process_frame(&self, mut frame: Frame) -> Frame {
+    /// Processes a single frame through all configured filters in sequence,
+    /// notifying `on_filter(filter_index_1_based, total_filters, filter_name)`
+    /// before applying each filter.
+    pub fn process_frame_with_progress<F: FnMut(usize, usize, &str)>(
+        &self,
+        mut frame: Frame,
+        mut on_filter: F,
+    ) -> Frame {
+        let total = self.filters.len();
         for (i, filter) in self.filters.iter().enumerate() {
             let filter_name = filter.name();
+            on_filter(i + 1, total, filter_name);
             let mut next_frame = filter.apply(&frame);
             next_frame.set_metadata(&format!("filter_{}", i), filter_name);
             frame = next_frame;
         }
         frame
+    }
+
+    pub fn process_frame(&self, frame: Frame) -> Frame {
+        self.process_frame_with_progress(frame, |_, _, _| {})
     }
 
     /// Processes frames in a stream from source to sink with an optional progress callback and optional max_frames limit.
@@ -92,5 +105,45 @@ impl Pipeline {
 impl Default for Pipeline {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::RgbImage;
+
+    struct DummyFilter(&'static str);
+    impl Filter for DummyFilter {
+        fn apply(&self, frame: &Frame) -> Frame {
+            frame.clone()
+        }
+        fn name(&self) -> &'static str {
+            self.0
+        }
+    }
+
+    #[test]
+    fn test_process_frame_with_progress() {
+        let pipeline = Pipeline::new()
+            .add_filter(DummyFilter("FilterA"))
+            .add_filter(DummyFilter("FilterB"));
+
+        let frame = Frame::new(RgbImage::new(4, 4), 0, 0.0);
+        let mut steps = Vec::new();
+        let processed = pipeline.process_frame_with_progress(frame, |idx, total, name| {
+            steps.push((idx, total, name.to_string()));
+        });
+
+        assert_eq!(
+            steps,
+            vec![
+                (1, 2, "FilterA".to_string()),
+                (2, 2, "FilterB".to_string())
+            ]
+        );
+        assert_eq!(processed.metadata().get("filter_0").unwrap(), "FilterA");
+        assert_eq!(processed.metadata().get("filter_1").unwrap(), "FilterB");
     }
 }

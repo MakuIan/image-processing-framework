@@ -1,12 +1,12 @@
-﻿use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use image_processing_framework::{
     FilterConfig, ImageSink, ImageSource, Pipeline, Sink, SomVideoConfig, Source, VideoEncoder,
-    VideoSink, VideoSource, calculate_psnr, calculate_ssim, decode_video_stream,
-    encode_video_stream, generate_diff_map,
+    VideoSink, VideoSource, calculate_psnr, calculate_ssim, create_progress_bar, create_spinner,
+    create_task_progress, decode_video_stream_with_progress, encode_video_stream_with_progress,
+    generate_diff_map,
 };
-use indicatif::{ProgressBar, ProgressStyle};
 
 // --- Standard-Konstanten fuer Pfade und CLI ---
 const ASSETS_DIR: &str = "assets";
@@ -17,14 +17,14 @@ const PROCESSED_SUFFIX: &str = "_processed";
 const DIFF_HEATMAP_SUFFIX: &str = "_diff_heatmap";
 const DEFAULT_ENCODER: &str = "auto";
 
-/// Image Processing Framework – Bild- und Video-Verarbeitung über die CLI
+/// Image Processing Framework - Bild- und Video-Verarbeitung ueber die CLI
 #[derive(Parser)]
 #[command(name = "image-processing-framework", version, about)]
 struct Cli {
     /// Eingabedatei (Bild: png/jpg/jpeg, Video: mp4/avi/mov/mkv/webm)
     input: PathBuf,
 
-    /// Ausgabepfad (standardmäßig automatisch in 'assets/output/' generiert)
+    /// Ausgabepfad (standardmaessig automatisch in 'assets/output/' generiert)
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -32,7 +32,7 @@ struct Cli {
     #[arg(long)]
     noise: bool,
 
-    /// Stärke des Rauschens (Standard: 15.0)
+    /// Staerke des Rauschens (Standard: 15.0)
     #[arg(long)]
     noise_sigma: Option<f64>,
 
@@ -44,11 +44,11 @@ struct Cli {
     #[arg(long)]
     blur: bool,
 
-    /// Stärke der Weichzeichnung / Sigma (Standard: 1.0)
+    /// Staerke der Weichzeichnung / Sigma (Standard: 1.0)
     #[arg(long)]
     blur_sigma: Option<f32>,
 
-    /// Bilateral-Filter (Kantenerhaltender Glätter) anwenden
+    /// Bilateral-Filter (Kantenerhaltender Glaetter) anwenden
     #[arg(long)]
     bilateral: bool,
 
@@ -64,7 +64,7 @@ struct Cli {
     #[arg(long)]
     bilateral_space: Option<f64>,
 
-    /// Video-Encoder für FFmpeg (auto, amf, nvenc, qsv, cpu)
+    /// Video-Encoder fuer FFmpeg (auto, amf, nvenc, qsv, cpu)
     #[arg(long, default_value = DEFAULT_ENCODER)]
     encoder: String,
 
@@ -72,24 +72,24 @@ struct Cli {
     #[arg(long)]
     max_frames: Option<usize>,
 
-    /// GPU-Compute-Shader (wgpu) für Filter verwenden (AMD/Nvidia/Intel)
+    /// GPU-Compute-Shader (wgpu) fuer Filter verwenden (AMD/Nvidia/Intel)
     #[arg(long)]
     gpu: bool,
 
     // --- SOM Video Kompression Flags ---
-    /// Aktiviert das SOM-Kompressionsexperiment für Videos
+    /// Aktiviert das SOM-Kompressionsexperiment fuer Videos
     #[arg(long)]
     som: bool,
 
-    /// Kantenlänge der quadratischen Kacheln / Blöcke (Standard: 4 für 4x4)
+    /// Kantenlaenge der quadratischen Kacheln / Bloecke (Standard: 4 fuer 4x4)
     #[arg(long, default_value_t = 4)]
     som_block_size: usize,
 
-    /// Gittergröße des SOM (Standard: 16 -> 16x16 = 256 Neuronen, alternativ z. B. 8 -> 64)
+    /// Gittergroesse des SOM (Standard: 16 -> 16x16 = 256 Neuronen, alternativ z. B. 8 -> 64)
     #[arg(long, default_value_t = 16)]
     som_grid: usize,
 
-    /// PSNR-Schwellenwert in dB für Keyframe-Generierung (Standard: 28.0 dB)
+    /// PSNR-Schwellenwert in dB fuer Keyframe-Generierung (Standard: 28.0 dB)
     #[arg(long, default_value_t = 28.0)]
     som_threshold: f64,
 
@@ -119,7 +119,7 @@ fn detect_input_kind(path: &Path) -> InputKind {
     }
 }
 
-/// Generiert den Ausgabepfad standardmäßig nach `assets/output/<stem>_processed.<ext>`
+/// Generiert den Ausgabepfad standardmaessig nach `assets/output/<stem>_processed.<ext>`
 /// Falls der Input nicht in assets/input liegt, bleibt der Zielordner assets/output.
 fn auto_output_path(input_path: &Path) -> PathBuf {
     let stem = input_path
@@ -136,7 +136,7 @@ fn auto_output_path(input_path: &Path) -> PathBuf {
         .join(format!("{}{}.{}", stem, PROCESSED_SUFFIX, ext))
 }
 
-/// Ermittelt den Pfad für die Diff-Heatmap passend zum Ausgabepfad
+/// Ermittelt den Pfad fuer die Diff-Heatmap passend zum Ausgabepfad
 fn diff_heatmap_path(output_path: &Path) -> PathBuf {
     let stem = output_path
         .file_stem()
@@ -200,7 +200,7 @@ fn build_pipeline(cli: &Cli) -> Pipeline {
         configs
     } else {
         println!(
-            "  Keine Filter-Flags gesetzt – verwende Standard-Pipeline (noise + bilateral + blur)."
+            "  Keine Filter-Flags gesetzt - verwende Standard-Pipeline (noise + bilateral + blur)."
         );
         FilterConfig::default_pipeline()
     };
@@ -212,7 +212,7 @@ fn build_pipeline(cli: &Cli) -> Pipeline {
     pipeline
 }
 
-/// Führt die Bild-Pipeline für eine einzelne Eingabedatei durch
+/// Fuehrt die Bild-Pipeline fuer eine einzelne Eingabedatei durch
 fn run_image_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let input_path = &cli.input;
 
@@ -233,13 +233,15 @@ fn run_image_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     println!("Input:  {:?}", input_path);
     println!("Output: {:?}", output_path);
 
-    // Step 1: Original-Bild über ImageSource laden
+    // Step 1: Original-Bild ueber ImageSource laden
     println!("Step 1: Bild laden via ImageSource...");
+    let pb_load = create_spinner("Lade Bilddatei...");
     let mut source = ImageSource::new(input_path);
     let original_frame = source
         .next_frame()
         .ok_or_else(|| format!("Konnte Bild nicht laden: {:?}", input_path))?;
     source.release();
+    pb_load.finish_and_clear();
 
     println!(
         "  Geladen: {}x{} (Index: {}, Timestamp: {:.2}s)",
@@ -257,9 +259,16 @@ fn run_image_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         println!("  Filter {}: {}", idx + 1, filter.name());
     }
 
-    // Step 3: Pipeline ausführen
-    println!("\nStep 3: Pipeline ausführen...");
-    let processed_frame = pipeline.process_frame(original_frame.clone());
+    // Step 3: Pipeline ausfuehren
+    println!("\nStep 3: Pipeline ausfuehren...");
+    let filter_count = pipeline.filters().len();
+    let pb_filters = create_progress_bar(filter_count as u64, "Wende Filter an");
+    let processed_frame =
+        pipeline.process_frame_with_progress(original_frame.clone(), |idx, total, name| {
+            pb_filters.set_message(format!("Filter {idx}/{total}: {name}"));
+            pb_filters.inc(1);
+        });
+    pb_filters.finish_and_clear();
 
     // Metadaten der verarbeiteten Frames anzeigen
     println!("  Angewandte Filter aus Frame-Metadaten:");
@@ -267,24 +276,39 @@ fn run_image_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         println!("    {}: {}", key, value);
     }
 
-    // Step 4: Ergebnis über ImageSink speichern
+    // Step 4: Ergebnis ueber ImageSink speichern
     println!("\nStep 4: Speichere Ergebnis via ImageSink...");
+    let pb_sink = create_progress_bar(2, "Speichere Bilddateien");
+    pb_sink.set_message("Schreibe verarbeitetes Bild...");
     let mut sink = ImageSink::new(&output_path);
     sink.write(&processed_frame)?;
     sink.release();
-    println!("  Verarbeitetes Bild: {:?}", output_path);
+    pb_sink.inc(1);
 
-    // Diff-Heatmap berechnen und passend zum Ausgabepfad speichern
+    pb_sink.set_message("Schreibe Diff-Heatmap...");
     let diff_path = diff_heatmap_path(&output_path);
     let diff_frame = generate_diff_map(&original_frame, &processed_frame);
     let mut diff_sink = ImageSink::new(&diff_path);
     diff_sink.write(&diff_frame)?;
     diff_sink.release();
-    println!("  Diff-Heatmap: {:?}", diff_path);
+    pb_sink.inc(1);
+    pb_sink.finish_and_clear();
 
-    // Step 5: Qualitätsmetriken berechnen
-    println!("\nStep 5: Qualitätsmetriken berechnen...");
+    println!("  Verarbeitetes Bild: {:?}", output_path);
+    println!("  Diff-Heatmap:       {:?}", diff_path);
+
+    // Step 5: Qualitaetsmetriken berechnen
+    println!("\nStep 5: Qualitaetsmetriken berechnen...");
+    let pb_metrics = create_progress_bar(2, "Berechne Metriken");
+    pb_metrics.set_message("Berechne PSNR...");
     let psnr = calculate_psnr(&original_frame, &processed_frame);
+    pb_metrics.inc(1);
+
+    pb_metrics.set_message("Berechne SSIM...");
+    let ssim = calculate_ssim(&original_frame, &processed_frame);
+    pb_metrics.inc(1);
+    pb_metrics.finish_and_clear();
+
     println!(
         "  PSNR: {:.2} dB",
         if psnr.is_infinite() {
@@ -293,15 +317,13 @@ fn run_image_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             psnr
         }
     );
-
-    let ssim = calculate_ssim(&original_frame, &processed_frame);
     println!("  SSIM: {:.4}", ssim);
 
     println!("\n=== Bild-Pipeline erfolgreich abgeschlossen ===");
     Ok(())
 }
 
-/// Führt das SOM-Video-Kompressionsexperiment durch
+/// Fuehrt das SOM-Video-Kompressionsexperiment durch
 fn run_som_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let input_path = &cli.input;
     if !input_path.is_file() {
@@ -330,7 +352,7 @@ fn run_som_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Codec-Konfiguration:");
     println!(
-        "  Blockgröße:          {}x{} Pixel",
+        "  Blockgroesse:         {}x{} Pixel",
         config.block_size, config.block_size
     );
     println!(
@@ -348,9 +370,15 @@ fn run_som_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let width = source.width();
     let height = source.height();
 
+    let total_hint = source.total_frames().map(|t| match cli.max_frames {
+        Some(limit) => t.min(limit),
+        None => t,
+    });
+    let pb_load = create_task_progress(total_hint, "Lade Frames");
     let mut raw_frames = Vec::new();
     while let Some(frame) = source.next_frame() {
         raw_frames.push(frame);
+        pb_load.inc(1);
         if let Some(limit) = cli.max_frames {
             if raw_frames.len() >= limit {
                 break;
@@ -358,6 +386,7 @@ fn run_som_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     source.release();
+    pb_load.finish_and_clear();
 
     if raw_frames.is_empty() {
         return Err("Keine Frames im Video gefunden".into());
@@ -370,19 +399,20 @@ fn run_som_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         fps
     );
 
-    println!("\nStep 2: SOM-Kompression durchführen (Intra- & Inter-Frame Redundanz)...");
-    let pb = ProgressBar::new(raw_frames.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] [{bar:30.cyan/blue}] {pos}/{len} Frames ({per_sec})")
-            .unwrap_or_else(|_| ProgressStyle::default_bar())
-            .progress_chars("#>-"),
-    );
+    println!("\nStep 2: SOM-Kompression durchfuehren (Intra- & Inter-Frame Redundanz)...");
+    let pb_encode = create_progress_bar(raw_frames.len() as u64, "SOM-Kompression");
+    let result = encode_video_stream_with_progress(&raw_frames, &config, |prog| {
+        let tag = if prog.is_keyframe {
+            "Keyframe"
+        } else {
+            "Interframe"
+        };
+        pb_encode.set_message(format!("{tag} | PSNR: {:.1} dB", prog.psnr_db));
+        pb_encode.inc(1);
+    });
+    pb_encode.finish_and_clear();
 
-    let result = encode_video_stream(&raw_frames, &config);
-    pb.finish_and_clear();
-
-    println!("\n=== Kompressions- & Qualitäts-Statistik ===");
+    println!("\n=== Kompressions- & Qualitaets-Statistik ===");
     println!("  Verarbeitete Frames:      {}", result.stats.total_frames);
     println!(
         "  Keyframes generiert:      {} ({:.1}% aller Frames)",
@@ -394,12 +424,12 @@ fn run_som_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         result.stats.avg_psnr_db
     );
     println!(
-        "  Rohdaten-Größe:           {:.2} MB ({} Bytes)",
+        "  Rohdaten-Groesse:          {:.2} MB ({} Bytes)",
         result.stats.raw_size as f64 / 1_048_576.0,
         result.stats.raw_size
     );
     println!(
-        "  Komprimierte Index-Größe: {:.2} KB ({} Bytes)",
+        "  Komprimierte Index-Groesse:{:.2} KB ({} Bytes)",
         result.stats.compressed_size as f64 / 1_024.0,
         result.stats.compressed_size
     );
@@ -408,25 +438,42 @@ fn run_som_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         result.stats.compression_ratio
     );
 
-    println!("\nStep 3: Dekodiere Videostrom & schreibe Ausgabevideo zur Qualitätsprüfung...");
-    let decoded_frames = decode_video_stream(&result.frames, width, height, &config, fps)
-        .map_err(|e| format!("Fehler beim Dekodieren: {}", e))?;
+    println!("\nStep 3: Dekodiere Videostrom & schreibe Ausgabevideo zur Qualitaetspruefung...");
+    let pb_decode = create_progress_bar(result.frames.len() as u64, "Dekodiere Frames");
+    let decoded_frames = decode_video_stream_with_progress(
+        &result.frames,
+        width,
+        height,
+        &config,
+        fps,
+        |_k, _total| {
+            pb_decode.inc(1);
+        },
+    )
+    .map_err(|e| format!("Fehler beim Dekodieren: {}", e))?;
+    pb_decode.finish_and_clear();
 
-    // Berechne durchschnittlichen SSIM über alle dekodierten Frames
+    // Berechne durchschnittlichen SSIM ueber alle dekodierten Frames
+    let pb_ssim = create_progress_bar(raw_frames.len() as u64, "Berechne SSIM");
     let mut total_ssim = 0.0;
     for (orig, dec) in raw_frames.iter().zip(decoded_frames.iter()) {
         total_ssim += calculate_ssim(orig, dec);
+        pb_ssim.inc(1);
     }
+    pb_ssim.finish_and_clear();
     let avg_ssim = total_ssim / raw_frames.len() as f64;
     println!("  Durchschnittlicher SSIM:  {:.4}", avg_ssim);
 
     // Ausgabe-Video via FFmpeg schreiben
     let encoder = VideoEncoder::from_str_loose(&cli.encoder);
     let mut sink = VideoSink::new(&output_path, fps as f32).with_encoder(encoder);
+    let pb_write = create_progress_bar(decoded_frames.len() as u64, "Schreibe Video (FFmpeg)");
     for frame in &decoded_frames {
         sink.write(frame)?;
+        pb_write.inc(1);
     }
     sink.release();
+    pb_write.finish_and_clear();
 
     if output_path.is_file() {
         let meta = std::fs::metadata(&output_path)?;
@@ -441,7 +488,7 @@ fn run_som_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Führt die Video-Pipeline für eine einzelne Eingabedatei durch
+/// Fuehrt die Video-Pipeline fuer eine einzelne Eingabedatei durch
 fn run_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let input_path = &cli.input;
 
@@ -486,7 +533,7 @@ fn run_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         println!("  Filter {}: {}", idx + 1, filter.name());
     }
 
-    println!("\nStep 3: Streaming-Verarbeitung ausführen...");
+    println!("\nStep 3: Streaming-Verarbeitung ausfuehren...");
 
     let total_frames = source.total_frames();
     let display_total = match (total_frames, cli.max_frames) {
@@ -496,31 +543,7 @@ fn run_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         (None, None) => None,
     };
 
-    let hz = 5;
-
-    let pb = if let Some(total) = display_total {
-        let bar = ProgressBar::new(total as u64);
-        bar.set_draw_target(indicatif::ProgressDrawTarget::stdout_with_hz(hz));
-        bar.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "[{elapsed_precise}] [{bar:30.cyan/blue}] {pos}/{len} ({per_sec}, ETA {eta})",
-                )
-                .unwrap_or_else(|_| ProgressStyle::default_bar())
-                .progress_chars("#>-"),
-        );
-        bar
-    } else {
-        let bar = ProgressBar::new_spinner();
-        bar.set_draw_target(indicatif::ProgressDrawTarget::stdout_with_hz(hz));
-        bar.set_style(
-            ProgressStyle::default_spinner()
-                .template("[{elapsed_precise}] {pos} Frames ({per_sec})")
-                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-        );
-        bar
-    };
-
+    let pb = create_task_progress(display_total, "Streaming-Verarbeitung");
     let pb_clone = pb.clone();
     let processed_count =
         pipeline.run_with_progress(&mut source, &mut sink, cli.max_frames, move |_count| {
@@ -569,8 +592,8 @@ fn main() {
         }
         InputKind::Unknown => {
             eprintln!(
-                "Fehler: Unbekannte Dateiendung für {:?}. \
-                 Unterstützt werden: png, jpg, jpeg (Bild) oder mp4, avi, mov, mkv, webm (Video).",
+                "Fehler: Unbekannte Dateiendung fuer {:?}. \
+                 Unterstuetzt werden: png, jpg, jpeg (Bild) oder mp4, avi, mov, mkv, webm (Video).",
                 cli.input
             );
             std::process::exit(1);

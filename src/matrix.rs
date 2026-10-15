@@ -20,14 +20,190 @@
 //! Lernrate `alpha(t)` und Nachbarschaftsradius `sigma(t)` klingen während
 //! des Trainings ab.
 //!
-//! Rayon beschleunigt die unabhängigen Anteile: die parallele BMU-Suche in
-//! [`SomMatrix::quantize_all`] sowie die parallele
-//! Nachbarschafts-Aktualisierung beim Training (disjunkte Neuronen-Vektoren).
-//! Die Reihenfolge der Samples im Training bleibt sequentiell, da jede
-//! Aktualisierung auf den jeweils aktuellen Gewichten aufbaut.
+//! Performance:
+//! - **SIMD-Vektorisierung (AVX2 + FMA / Scalar-Fallback)**: Beschleunigt die
+//!   Abstandsberechnung ([`SomMatrix::squared_distance`]), die BMU-Suche und
+//!   die Vektor-Aktualisierungen auf Instruktionsebene um ein Vielfaches.
+//! - **Rayon (Multithreading)**: Beschleunigt die unabhängige BMU-Suche aller
+//!   Blöcke in [`SomMatrix::quantize_all`].
+//! - Beim Training mit typischen Gittergrößen (bis 256 Neuronen) vermeidet
+//!   die sequentielle SIMD-Aktualisierung den Thread-Synchronisations-Overhead pro Sample,
+//!   sodass das Training extrem schnell im CPU-L1/L2-Cache abläuft.
 
 use rand::{Rng, thread_rng};
 use rayon::prelude::*;
+
+#[cfg(target_arch = "x86_64")]
+mod simd_x86 {
+    use std::arch::x86_64::*;
+
+    #[inline]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    pub unsafe fn hsum256_ps(v: __m256) -> f32 {
+        let vlow = _mm256_castps256_ps128(v);
+        let vhigh = _mm256_extractf128_ps(v, 1);
+        let v128 = _mm_add_ps(vlow, vhigh);
+        let shuf = _mm_movehl_ps(v128, v128);
+        let sums = _mm_add_ps(v128, shuf);
+        let shuf2 = _mm_shuffle_ps(sums, sums, 1);
+        let res = _mm_add_ss(sums, shuf2);
+        _mm_cvtss_f32(res)
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    pub unsafe fn squared_distance_avx2(a: &[f32], b: &[f32]) -> f32 {
+        let mut sum0 = _mm256_setzero_ps();
+        let mut sum1 = _mm256_setzero_ps();
+
+        let chunks_a = a.chunks_exact(16);
+        let chunks_b = b.chunks_exact(16);
+        let rem_a = chunks_a.remainder();
+        let rem_b = chunks_b.remainder();
+
+        for (ca, cb) in chunks_a.zip(chunks_b) {
+            let va0 = unsafe { _mm256_loadu_ps(ca.as_ptr()) };
+            let vb0 = unsafe { _mm256_loadu_ps(cb.as_ptr()) };
+            let diff0 = _mm256_sub_ps(va0, vb0);
+            sum0 = _mm256_fmadd_ps(diff0, diff0, sum0);
+
+            let va1 = unsafe { _mm256_loadu_ps(ca.as_ptr().add(8)) };
+            let vb1 = unsafe { _mm256_loadu_ps(cb.as_ptr().add(8)) };
+            let diff1 = _mm256_sub_ps(va1, vb1);
+            sum1 = _mm256_fmadd_ps(diff1, diff1, sum1);
+        }
+
+        let mut sum = _mm256_add_ps(sum0, sum1);
+
+        let chunks8_a = rem_a.chunks_exact(8);
+        let chunks8_b = rem_b.chunks_exact(8);
+        let final_rem_a = chunks8_a.remainder();
+        let final_rem_b = chunks8_b.remainder();
+
+        for (ca, cb) in chunks8_a.zip(chunks8_b) {
+            let va = unsafe { _mm256_loadu_ps(ca.as_ptr()) };
+            let vb = unsafe { _mm256_loadu_ps(cb.as_ptr()) };
+            let diff = _mm256_sub_ps(va, vb);
+            sum = _mm256_fmadd_ps(diff, diff, sum);
+        }
+
+        let mut total = unsafe { hsum256_ps(sum) };
+        for (x, y) in final_rem_a.iter().zip(final_rem_b.iter()) {
+            let d = x - y;
+            total += d * d;
+        }
+        total
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    pub unsafe fn update_vector_avx2(code: &mut [f32], sample: &[f32], eta: f32) {
+        let v_eta = _mm256_set1_ps(eta);
+        let rem_len = code.len() % 8;
+        let split_idx = code.len() - rem_len;
+        let (main_code, rem_code) = code.split_at_mut(split_idx);
+        let (main_sample, rem_sample) = sample.split_at(split_idx);
+
+        for (cc, cs) in main_code
+            .chunks_exact_mut(8)
+            .zip(main_sample.chunks_exact(8))
+        {
+            let vc = unsafe { _mm256_loadu_ps(cc.as_ptr()) };
+            let vs = unsafe { _mm256_loadu_ps(cs.as_ptr()) };
+            let diff = _mm256_sub_ps(vs, vc);
+            let updated = _mm256_fmadd_ps(v_eta, diff, vc);
+            unsafe { _mm256_storeu_ps(cc.as_mut_ptr(), updated) };
+        }
+
+        for (c, s) in rem_code.iter_mut().zip(rem_sample.iter()) {
+            *c += eta * (*s - *c);
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    pub unsafe fn find_bmu_avx2(weights: &[Vec<f32>], sample: &[f32]) -> usize {
+        let mut best_index = 0usize;
+        let mut best_dist = f32::INFINITY;
+        for (i, code) in weights.iter().enumerate() {
+            let dist = unsafe { squared_distance_avx2(sample, code) };
+            if dist < best_dist {
+                best_dist = dist;
+                best_index = i;
+            }
+        }
+        best_index
+    }
+}
+
+mod simd_fallback {
+    #[inline]
+    pub fn squared_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
+        let mut sum0 = 0.0f32;
+        let mut sum1 = 0.0f32;
+        let mut sum2 = 0.0f32;
+        let mut sum3 = 0.0f32;
+
+        let chunks_a = a.chunks_exact(4);
+        let chunks_b = b.chunks_exact(4);
+        let rem_a = chunks_a.remainder();
+        let rem_b = chunks_b.remainder();
+
+        for (ca, cb) in chunks_a.zip(chunks_b) {
+            let d0 = ca[0] - cb[0];
+            let d1 = ca[1] - cb[1];
+            let d2 = ca[2] - cb[2];
+            let d3 = ca[3] - cb[3];
+            sum0 += d0 * d0;
+            sum1 += d1 * d1;
+            sum2 += d2 * d2;
+            sum3 += d3 * d3;
+        }
+
+        let mut total = (sum0 + sum1) + (sum2 + sum3);
+        for (x, y) in rem_a.iter().zip(rem_b.iter()) {
+            let d = x - y;
+            total += d * d;
+        }
+        total
+    }
+
+    #[inline]
+    pub fn update_vector_scalar(code: &mut [f32], sample: &[f32], eta: f32) {
+        let rem_len = code.len() % 4;
+        let split_idx = code.len() - rem_len;
+        let (main_code, rem_code) = code.split_at_mut(split_idx);
+        let (main_sample, rem_sample) = sample.split_at(split_idx);
+
+        for (c, s) in main_code
+            .chunks_exact_mut(4)
+            .zip(main_sample.chunks_exact(4))
+        {
+            c[0] += eta * (s[0] - c[0]);
+            c[1] += eta * (s[1] - c[1]);
+            c[2] += eta * (s[2] - c[2]);
+            c[3] += eta * (s[3] - c[3]);
+        }
+
+        for (c, s) in rem_code.iter_mut().zip(rem_sample.iter()) {
+            *c += eta * (*s - *c);
+        }
+    }
+
+    #[inline]
+    pub fn find_bmu_scalar(weights: &[Vec<f32>], sample: &[f32]) -> usize {
+        let mut best_index = 0usize;
+        let mut best_dist = f32::INFINITY;
+        for (i, code) in weights.iter().enumerate() {
+            let dist = squared_distance_scalar(sample, code);
+            if dist < best_dist {
+                best_dist = dist;
+                best_index = i;
+            }
+        }
+        best_index
+    }
+}
 
 /// Self-Organizing Map (Kohonen-Netz) über einem 2D-Neurongitter.
 #[derive(Debug, Clone)]
@@ -107,25 +283,29 @@ impl SomMatrix {
         (index / width, index % width)
     }
 
-    /// Quadratische euklidische Distanz zweier Vektoren.
+    /// Quadratische euklidische Distanz zweier Vektoren (SIMD-beschleunigt).
     #[inline]
-    fn squared_distance(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
+    pub fn squared_distance(a: &[f32], b: &[f32]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return unsafe { simd_x86::squared_distance_avx2(a, b) };
+            }
+        }
+        simd_fallback::squared_distance_scalar(a, b)
     }
 
     /// Findet die Best Matching Unit: das Neuron, dessen Codevektor den
     /// kleinsten quadratischen euklidischen Abstand zum Sample hat.
+    #[inline]
     fn find_bmu(&self, sample: &[f32]) -> usize {
-        let mut best_index = 0usize;
-        let mut best_dist = f32::INFINITY;
-        for (i, code) in self.weights.iter().enumerate() {
-            let dist = Self::squared_distance(sample, code);
-            if dist < best_dist {
-                best_dist = dist;
-                best_index = i;
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return unsafe { simd_x86::find_bmu_avx2(&self.weights, sample) };
             }
         }
-        best_index
+        simd_fallback::find_bmu_scalar(&self.weights, sample)
     }
 
     /// Trainiert die SOM mit dem Kohonen-Verfahren.
@@ -156,6 +336,11 @@ impl SomMatrix {
         let initial_sigma = (self.grid_width.max(self.grid_height) / 2).max(1) as f32;
         let final_sigma = 1.0_f32;
 
+        #[cfg(target_arch = "x86_64")]
+        let use_avx2 = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+        #[cfg(not(target_arch = "x86_64"))]
+        let use_avx2 = false;
+
         for epoch in 0..epochs {
             // Lineare Abklingung: initial_lr -> initial_lr / epochs (bleibt > 0).
             let alpha = initial_lr * (epochs - epoch) as f32 / epochs as f32;
@@ -177,40 +362,57 @@ impl SomMatrix {
                     self.vector_dim
                 );
 
-                let bmu = self.find_bmu(sample);
-                self.update_neighborhood(sample, bmu, alpha, sigma_sq);
+                let bmu = if use_avx2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        simd_x86::find_bmu_avx2(&self.weights, sample)
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        self.find_bmu(sample)
+                    }
+                } else {
+                    simd_fallback::find_bmu_scalar(&self.weights, sample)
+                };
+
+                self.update_neighborhood_simd(sample, bmu, alpha, sigma_sq, use_avx2);
             }
         }
     }
 
     /// Aktualisiert alle Neuronen innerhalb des Radius `sigma` (Gitterdistanz
-    /// `d` mit `d <= sigma`) in Richtung des Samples.
-    ///
-    /// Die Neuronen halten disjunkte Vektoren, ihre Aktualisierung ist
-    /// unabhängig und wird daher parallel mit Rayon ausgeführt.
-    fn update_neighborhood(&mut self, sample: &[f32], bmu: usize, alpha: f32, sigma_sq: f32) {
+    /// `d` mit `d <= sigma`) in Richtung des Samples unter Nutzung von SIMD.
+    fn update_neighborhood_simd(
+        &mut self,
+        sample: &[f32],
+        bmu: usize,
+        alpha: f32,
+        sigma_sq: f32,
+        use_avx2: bool,
+    ) {
         let (bmy, bmx) = Self::grid_position(bmu, self.grid_width);
         let width = self.grid_width;
-        let dim = self.vector_dim;
         let two_sigma_sq = 2.0 * sigma_sq;
 
-        self.weights
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, code)| {
-                let (ny, nx) = Self::grid_position(i, width);
-                let dy = ny as i32 - bmy as i32;
-                let dx = nx as i32 - bmx as i32;
-                let dist_sq = (dy * dy + dx * dx) as f32;
-                if dist_sq > sigma_sq {
-                    return;
-                }
+        for (i, code) in self.weights.iter_mut().enumerate() {
+            let (ny, nx) = Self::grid_position(i, width);
+            let dy = ny as i32 - bmy as i32;
+            let dx = nx as i32 - bmx as i32;
+            let dist_sq = (dy * dy + dx * dx) as f32;
+            if dist_sq > sigma_sq {
+                continue;
+            }
 
-                let eta = alpha * (-dist_sq / two_sigma_sq).exp();
-                for d in 0..dim {
-                    code[d] += eta * (sample[d] - code[d]);
+            let eta = alpha * (-dist_sq / two_sigma_sq).exp();
+            if use_avx2 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    simd_x86::update_vector_avx2(code, sample, eta);
                 }
-            });
+            } else {
+                simd_fallback::update_vector_scalar(code, sample, eta);
+            }
+        }
     }
 
     /// Quantisiert einen Block: liefert den 1D-Index (`0..255`) der BMU,
@@ -231,9 +433,28 @@ impl SomMatrix {
     }
 
     /// Quantisiert alle Blöcke. Die BMU-Suche pro Block ist unabhängig und
-    /// wird daher parallel mit Rayon ausgeführt; die Reihenfolge bleibt
-    /// erhalten.
+    /// wird daher parallel mit Rayon und pro Block mit SIMD ausgeführt;
+    /// die Reihenfolge bleibt erhalten.
     pub fn quantize_all(&self, blocks: &[Vec<f32>]) -> Vec<u8> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return blocks
+                    .par_iter()
+                    .map(|b| {
+                        assert_eq!(
+                            b.len(),
+                            self.vector_dim,
+                            "block has {} sample(s), expected {}",
+                            b.len(),
+                            self.vector_dim
+                        );
+                        unsafe { simd_x86::find_bmu_avx2(&self.weights, b) as u8 }
+                    })
+                    .collect();
+            }
+        }
+
         blocks.par_iter().map(|b| self.quantize_block(b)).collect()
     }
 
@@ -366,6 +587,43 @@ mod tests {
         assert_eq!(som.grid_height, 2);
         assert_eq!(som.weights.len(), 4);
         assert!(som.weights.iter().all(|w| w.len() == 2));
+    }
+
+    #[test]
+    fn simd_and_scalar_squared_distance_match() {
+        let v1: Vec<f32> = (0..48).map(|i| (i as f32 * 0.3).sin()).collect();
+        let v2: Vec<f32> = (0..48).map(|i| (i as f32 * 0.7).cos()).collect();
+
+        let scalar_dist = simd_fallback::squared_distance_scalar(&v1, &v2);
+        let simd_dist = SomMatrix::squared_distance(&v1, &v2);
+
+        assert!(
+            (scalar_dist - simd_dist).abs() < 1e-4,
+            "Scalar {scalar_dist} and SIMD {simd_dist} differ by {}",
+            (scalar_dist - simd_dist).abs()
+        );
+    }
+
+    #[test]
+    fn simd_and_scalar_update_vector_match() {
+        let mut code_scalar: Vec<f32> = (0..48).map(|i| i as f32 * 0.1).collect();
+        let mut code_simd = code_scalar.clone();
+        let sample: Vec<f32> = (0..48).map(|i| (i as f32 * 0.2).sin()).collect();
+        let eta = 0.25f32;
+
+        simd_fallback::update_vector_scalar(&mut code_scalar, &sample, eta);
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            unsafe {
+                simd_x86::update_vector_avx2(&mut code_simd, &sample, eta);
+            }
+            for (i, (s, a)) in code_scalar.iter().zip(code_simd.iter()).enumerate() {
+                assert!(
+                    (s - a).abs() < 1e-5,
+                    "Mismatch at index {i}: scalar={s}, avx2={a}"
+                );
+            }
+        }
     }
 
     #[test]

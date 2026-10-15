@@ -1,26 +1,26 @@
-//! SOM-gestützte Video-Kompression.
+﻿//! SOM-gestÃ¼tzte Video-Kompression.
 //!
-//! Das Frame-Stream-Codec quantisiert 4x4-RGB-Bildblöcke mit einer
-//! Self-Organizing Map (SOM) auf Indizes `0..=255` und überträgt pro Frame
+//! Das Frame-Stream-Codec quantisiert 4x4-RGB-BildblÃ¶cke mit einer
+//! Self-Organizing Map (SOM) auf Indizes `0..=255` und Ã¼bertrÃ¤gt pro Frame
 //! nur diese Indizes (RLE + Deflate). Der Codebook-Zustand (SOM-Gewichte)
 //! wird nicht bei jedem Frame gesendet, sondern nur in **Keyframes**:
 //!
 //! 1. **Frame 0 ist immer ein Keyframe**: Es gibt noch keine gemeinsame
-//!    SOM, daher wird auf den Blöcken von Frame 0 ein neues SOM trainiert.
-//!    Das Paket enthält die SOM-Gewichte plus die komprimierten Indizes.
+//!    SOM, daher wird auf den BlÃ¶cken von Frame 0 ein neues SOM trainiert.
+//!    Das Paket enthÃ¤lt die SOM-Gewichte plus die komprimierten Indizes.
 //!
-//! 2. **Frame k > 0**: Die Blöcke werden mit der *bisherigen* SOM
+//! 2. **Frame k > 0**: Die BlÃ¶cke werden mit der *bisherigen* SOM
 //!    enkodiert und der Frame testweise rekonstruiert. Ist die PSNR
-//!    gegenüber dem Original mindestens `psnr_threshold_db`, ist der
-//!    Codebook-Zustand weiterhin gültig: Es wird kein Keyframe erzeugt und
+//!    gegenÃ¼ber dem Original mindestens `psnr_threshold_db`, ist der
+//!    Codebook-Zustand weiterhin gÃ¼ltig: Es wird kein Keyframe erzeugt und
 //!    nur das Index-Paket gesendet. Liegt die PSNR darunter, wird auf den
-//!    Blöcken von Frame k ein neues SOM trainiert, Frame k wird damit als
-//!    Keyframe erneut enkodiert und das Paket enthält die neuen
+//!    BlÃ¶cken von Frame k ein neues SOM trainiert, Frame k wird damit als
+//!    Keyframe erneut enkodiert und das Paket enthÃ¤lt die neuen
 //!    SOM-Gewichte plus die komprimierten Indizes.
 //!
-//! Der Decoder arbeitet damit sequenziell: Er hält die zuletzt empfangene
-//! SOM, liest bei jedem Frame die Indizes, und übernimmt bei Keyframes
-//! zusätzlich die neuen SOM-Gewichte, bevor die Blöcke rekonstruiert werden.
+//! Der Decoder arbeitet damit sequenziell: Er hÃ¤lt die zuletzt empfangene
+//! SOM, liest bei jedem Frame die Indizes, und Ã¼bernimmt bei Keyframes
+//! zusÃ¤tzlich die neuen SOM-Gewichte, bevor die BlÃ¶cke rekonstruiert werden.
 
 use crate::block::{BlockConfig, extract_blocks, reconstruct_image};
 use crate::compression::{compress_indices, decompress_indices};
@@ -29,14 +29,14 @@ use crate::frame::Frame;
 use crate::matrix::SomMatrix;
 use image::RgbImage;
 
-/// Anfangslernrate für das Kohonen-Training (lineare Abklingung erfolgt in
+/// Anfangslernrate fÃ¼r das Kohonen-Training (lineare Abklingung erfolgt in
 /// [`SomMatrix::train`]).
 const INITIAL_LEARNING_RATE: f32 = 0.3;
 
 /// Parameter des SOM-Video-Codecs.
 #[derive(Clone, Debug)]
 pub struct SomVideoConfig {
-    /// Kantenlänge der Quadrate-Blöcke in Pixeln (Standard: `4`).
+    /// KantenlÃ¤nge der Quadrate-BlÃ¶cke in Pixeln (Standard: `4`).
     pub block_size: usize,
     /// Gitterseite des SOM: `som_grid_size x som_grid_size` Neuronen
     /// (Standard: `16` -> 256 Codevektoren).
@@ -79,8 +79,8 @@ impl SomVideoConfig {
 /// Datenpaket pro Frame des komprimierten Streams.
 #[derive(Clone, Debug)]
 pub struct EncodedFrame {
-    /// `true`, wenn `som_matrix` eine neue SOM enthält, die der Decoder
-    /// übernehmen muss, bevor die Indizes dekodiert werden.
+    /// `true`, wenn `som_matrix` eine neue SOM enthÃ¤lt, die der Decoder
+    /// Ã¼bernehmen muss, bevor die Indizes dekodiert werden.
     pub is_keyframe: bool,
     /// Serialisierte SOM-Gewichte (`neuron_count * vector_dim` f32-Werte,
     /// little-endian). Exakt dann vorhanden, wenn `is_keyframe == true`.\
@@ -96,15 +96,15 @@ pub struct VideoCodecStats {
     pub total_frames: usize,
     /// Anzahl der Keyframes (Frames mit neuem SOM).
     pub keyframe_count: usize,
-    /// PSNR-Mittel über alle Frames mit endlicher PSNR (dB). `f64::INFINITY`,
+    /// PSNR-Mittel Ã¼ber alle Frames mit endlicher PSNR (dB). `f64::INFINITY`,
     /// wenn alle Frames verlustfrei rekonstruiert wurden; `0.0`, wenn es
     /// keine Frames (oder keine endlichen PSNR-Werte) gab.
     pub avg_psnr_db: f64,
-    /// Summe der Rohdaten-Größen aller Frames in Bytes.
+    /// Summe der Rohdaten-GrÃ¶ÃŸen aller Frames in Bytes.
     pub raw_size: u64,
     /// Summe der komprimierten Index-Pakete aller Frames in Bytes.
     /// (Keyframe-SOM-Gewichte sind nicht enthalten; sie werden als
-    /// Codebook-Zustand separat übertragen.)
+    /// Codebook-Zustand separat Ã¼bertragen.)
     pub compressed_size: u64,
     /// Kompressionsfaktor `raw_size / compressed_size` (oder
     /// `f64::INFINITY`, wenn die komprimierten Pakete leer sind).
@@ -136,7 +136,7 @@ pub fn serialize_som(som: &SomMatrix) -> Vec<u8> {
 /// Gewichten wieder her.
 ///
 /// # Panics
-/// Panics, wenn `data` nicht die erwartete Größe
+/// Panics, wenn `data` nicht die erwartete GrÃ¶ÃŸe
 /// (`grid_width * grid_height * vector_dim * 4` Bytes) hat.
 pub fn deserialize_som(
     data: &[u8],
@@ -184,7 +184,7 @@ fn frame_to_raw(frame: &Frame) -> Vec<u8> {
     raw.to_vec()
 }
 
-/// Trainiert auf den Blöcken von `frame` eine neue SOM gemäß `config`.
+/// Trainiert auf den BlÃ¶cken von `frame` eine neue SOM gemÃ¤ÃŸ `config`.
 fn train_som_on_frame(
     frame: &Frame,
     config: &BlockConfig,
@@ -204,7 +204,7 @@ fn train_som_on_frame(
     som
 }
 
-/// Einkodiert die Blöcke von `frame` mit `som` und liefert das
+/// Einkodiert die BlÃ¶cke von `frame` mit `som` und liefert das
 /// RLE+Deflate-Paket der Indizes.
 fn encode_frame_indices(frame: &Frame, som: &SomMatrix, config: &BlockConfig) -> Vec<u8> {
     let blocks = extract_blocks(&frame_to_raw(frame), frame.width(), frame.height(), config);
@@ -212,8 +212,8 @@ fn encode_frame_indices(frame: &Frame, som: &SomMatrix, config: &BlockConfig) ->
     compress_indices(&indices)
 }
 
-/// Rekonstruiert `frame` testweise über die Indizes der SOM `som`:
-/// Blöcke extrahieren, quantisieren, Codevektoren in ein Frame zerlegen.
+/// Rekonstruiert `frame` testweise Ã¼ber die Indizes der SOM `som`:
+/// BlÃ¶cke extrahieren, quantisieren, Codevektoren in ein Frame zerlegen.
 fn reconstruct_frame_with_som(frame: &Frame, som: &SomMatrix, config: &BlockConfig) -> Frame {
     let blocks = extract_blocks(&frame_to_raw(frame), frame.width(), frame.height(), config);
     let indices = som.quantize_all(&blocks);
@@ -228,16 +228,38 @@ fn reconstruct_frame_with_som(frame: &Frame, som: &SomMatrix, config: &BlockConf
     frame.clone_with_data(image.expect("reconstructed image buffer must match dimensions"))
 }
 
-/// Einkodiert einen Frame-Stream gemäß `config`.
+/// Einkodiert einen Frame-Stream gemÃ¤ÃŸ `config`.
 ///
-/// Siehe Modul-Dokumentation für den Keyframe-Algorithmus. Für jeden
+/// Siehe Modul-Dokumentation fÃ¼r den Keyframe-Algorithmus. FÃ¼r jeden
 /// Eingabe-Frame liefert die Ausgabe genau ein [`EncodedFrame`]-Paket;
 /// Frame 0 ist immer ein Keyframe.
 ///
 /// # Panics
 /// Panics auf leeren Streams oder auf Frames, die kleiner als ein einzelner
-/// Block sind (es gäbe nichts zu quantisieren).
-pub fn encode_video_stream(frames: &[Frame], config: &SomVideoConfig) -> EncodeResult {
+/// Block sind (es gÃ¤be nichts zu quantisieren).
+/// Fortschritts-Info fuer einen kodierten Frame.
+#[derive(Clone, Copy, Debug)]
+pub struct EncodeFrameProgress {
+    pub frame_index: usize,
+    pub total_frames: usize,
+    pub is_keyframe: bool,
+    pub psnr_db: f64,
+}
+
+/// Einkodiert einen Frame-Stream gemaess `config` mit Fortschritts-Callback.
+///
+/// Siehe Modul-Dokumentation fuer den Keyframe-Algorithmus. Fuer jeden
+/// Eingabe-Frame liefert die Ausgabe genau ein [`EncodedFrame`]-Paket;
+/// Frame 0 ist immer ein Keyframe.
+///
+/// # Panics
+/// Panics auf leeren Streams oder auf Frames, die kleiner als ein einzelner
+/// Block sind (es gaebe nichts zu quantisieren).
+pub fn encode_video_stream_with_progress<F: FnMut(EncodeFrameProgress)>(
+    frames: &[Frame],
+    config: &SomVideoConfig,
+    mut on_progress: F,
+) -> EncodeResult {
     assert!(!frames.is_empty(), "frames must not be empty");
     assert!(
         config.block_size > 0,
@@ -284,7 +306,7 @@ pub fn encode_video_stream(frames: &[Frame], config: &SomVideoConfig) -> EncodeR
         let mut frame_psnr = calculate_psnr(frame, &recon);
 
         let is_keyframe = if k == 0 {
-            // Neues SOM auf Frame 0: Paket enthält Gewichte + Indizes.
+            // Neues SOM auf Frame 0: Paket enthaelt Gewichte + Indizes.
             true
         } else if frame_psnr < config.psnr_threshold_db {
             // Codebook passt nicht mehr: neues SOM trainieren, neu kodieren.
@@ -325,6 +347,13 @@ pub fn encode_video_stream(frames: &[Frame], config: &SomVideoConfig) -> EncodeR
 
         raw_size += (frame.width() as u64) * (frame.height() as u64) * 3;
         compressed_size += compressed_len;
+
+        on_progress(EncodeFrameProgress {
+            frame_index: k + 1,
+            total_frames: frames.len(),
+            is_keyframe,
+            psnr_db: frame_psnr,
+        });
     }
 
     let avg_psnr_db = if finite_psnrs.is_empty() {
@@ -354,13 +383,19 @@ pub fn encode_video_stream(frames: &[Frame], config: &SomVideoConfig) -> EncodeR
     }
 }
 
-/// Dekodiert einen Strom von [`EncodedFrame`]-Paketen zurück in RGB-[`Frame`]s.
-pub fn decode_video_stream(
+/// Einkodiert einen Frame-Stream gemaess `config`.
+pub fn encode_video_stream(frames: &[Frame], config: &SomVideoConfig) -> EncodeResult {
+    encode_video_stream_with_progress(frames, config, |_| {})
+}
+
+/// Dekodiert einen Strom von [`EncodedFrame`]-Paketen zurueck in RGB-[`Frame`]s mit Fortschritts-Callback.
+pub fn decode_video_stream_with_progress<F: FnMut(usize, usize)>(
     encoded_frames: &[EncodedFrame],
     width: u32,
     height: u32,
     config: &SomVideoConfig,
     fps: f64,
+    mut on_progress: F,
 ) -> Result<Vec<Frame>, String> {
     if encoded_frames.is_empty() {
         return Ok(Vec::new());
@@ -397,13 +432,25 @@ pub fn decode_video_stream(
 
         let recon_raw = reconstruct_image(&recon_blocks, width, height, &block_config);
         let image = RgbImage::from_raw(width, height, recon_raw)
-            .ok_or_else(|| "Ungültige Dimensionen für rekonstruiertes Bild".to_string())?;
+            .ok_or_else(|| "Ungueltige Dimensionen fuer rekonstruiertes Bild".to_string())?;
 
         let timestamp = if fps > 0.0 { k as f64 / fps } else { 0.0 };
         frames_out.push(Frame::new(image, k, timestamp));
+        on_progress(k + 1, encoded_frames.len());
     }
 
     Ok(frames_out)
+}
+
+/// Dekodiert einen Strom von [`EncodedFrame`]-Paketen zurueck in RGB-[`Frame`]s.
+pub fn decode_video_stream(
+    encoded_frames: &[EncodedFrame],
+    width: u32,
+    height: u32,
+    config: &SomVideoConfig,
+    fps: f64,
+) -> Result<Vec<Frame>, String> {
+    decode_video_stream_with_progress(encoded_frames, width, height, config, fps, |_, _| {})
 }
 
 #[cfg(test)]
@@ -510,8 +557,8 @@ mod tests {
 
     #[test]
     fn identical_frames_yield_few_keyframes() {
-        // Bei identischen, gleichförmigen Frames bleibt das trainierte SOM exakt
-        // und die PSNR ist unendlich oder weit über dem Schwellenwert.
+        // Bei identischen, gleichfÃ¶rmigen Frames bleibt das trainierte SOM exakt
+        // und die PSNR ist unendlich oder weit Ã¼ber dem Schwellenwert.
         let frames = vec![
             make_solid_frame(0, 100),
             make_solid_frame(1, 100),
@@ -580,5 +627,29 @@ mod tests {
             ..default_config()
         };
         encode_video_stream(&frames, &config);
+    }
+
+    #[test]
+    fn encode_and_decode_with_progress_callbacks() {
+        let frames = vec![make_frame(0, 0), make_frame(1, 10)];
+        let mut progress_counts = Vec::new();
+        let result = encode_video_stream_with_progress(&frames, &default_config(), |prog| {
+            progress_counts.push(prog.frame_index);
+        });
+        assert_eq!(progress_counts, vec![1, 2]);
+
+        let mut decode_counts = Vec::new();
+        let decoded = decode_video_stream_with_progress(
+            &result.frames,
+            16,
+            16,
+            &default_config(),
+            30.0,
+            |idx, total| {
+                decode_counts.push((idx, total));
+            },
+        ).expect("decoding should succeed");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decode_counts, vec![(1, 2), (2, 2)]);
     }
 }

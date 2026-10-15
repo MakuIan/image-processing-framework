@@ -153,8 +153,6 @@ cargo run --release -- <INPUT> [OPTIONEN]
 
 ## SOM-Videokompression (Neuronale Vektorquantisierung)
 
-Das Modul nutzt ein klassisches Verfahren der neuronalen Bild- und Videokompression zur Reduktion von Redundanzen:
-
 1. **Räumliche Redundanz (Intra-Frame):**  
    Bilder werden in Kacheln zerlegt (z. B. 4x4 Pixel mit 3 Kanälen = 48 Dimensionen). Ein zweidimensionales Kohonen-Gitter (SOM) lernt ein repräsentatives Codebuch. Jeder Block wird durch die Best Matching Unit (BMU) approximiert und als 1-Byte-Index (`u8`) dargestellt.
 2. **Topologische Ordnung & Entropiekodierung:**  
@@ -163,41 +161,6 @@ Das Modul nutzt ein klassisches Verfahren der neuronalen Bild- und Videokompress
    Frame 0 startet als Keyframe mit neu trainiertem Codebuch. Für jeden Folgeframe wird das bestehende Codebuch getestet:
    - Erreicht die Rekonstruktion mindestens den Schwellenwert (z. B. `28.0 dB` PSNR), wird das SOM beibehalten und nur der kompakte Index-Datenstrom übertragen.
    - Sinkt die Qualität (z. B. durch Szenenwechsel oder starke Bewegung), wird ein neuer Keyframe getriggert, ein neues SOM trainiert und die Codebuch-Gewichte übertragen.
-
----
-
-## Praxisbeispiele
-
-### Bildverarbeitung
-```powershell
-# Bild mit Standard-Pipeline filtern
-cargo run --release -- assets/input/test.png
-
-# Bild mit spezifischem Rausch- und Glättungsfilter
-cargo run --release -- assets/input/test.png --noise-sigma 20.0 --bilateral-radius 5
-```
-
-### Videoverarbeitung & Filter
-```powershell
-# Erste 60 Frames eines Videos filtern
-cargo run --release -- assets/input/video.mp4 --max-frames 60 --blur-sigma 2.0
-```
-
-### SOM-Videokompression & Qualitätsuntersuchung
-
-```powershell
-# Standard-Kompression (4x4 Blöcke, 16x16 SOM = 256 Neuronen, 28 dB Schwelle)
-cargo run --release -- assets/input/video.mp4 --som --max-frames 30
-
-# Schnelleres Training mit kleinerem Codebuch (8x8 SOM = 64 Neuronen)
-cargo run --release -- assets/input/video.mp4 --som --som-grid 8 --max-frames 30
-
-# Größere Kacheln (8x8 Blöcke) für höhere Kompression bei geringerer Detailtreue
-cargo run --release -- assets/input/video.mp4 --som --som-block-size 8 --max-frames 30
-
-# Strengere Qualitätsschwelle (32 dB -> führt zu mehr Keyframes bei Szenenwechseln)
-cargo run --release -- assets/input/video.mp4 --som --som-threshold 32.0 --max-frames 30
-```
 
 ---
 

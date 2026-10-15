@@ -8,7 +8,9 @@ pub mod gpu;
 pub mod io;
 pub mod matrix;
 pub mod pipeline;
+pub mod progress;
 pub mod video_codec;
+
 pub use base::*;
 pub use block::*;
 pub use compression::*;
@@ -19,4 +21,5 @@ pub use gpu::*;
 pub use io::*;
 pub use matrix::*;
 pub use pipeline::*;
+pub use progress::*;
 pub use video_codec::*;
