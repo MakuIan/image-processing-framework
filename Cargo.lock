@@ -811,6 +811,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "clap",
+ "flate2",
  "image",
  "imageproc",
  "indicatif",

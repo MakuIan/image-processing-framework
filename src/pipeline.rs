@@ -47,11 +47,10 @@ impl Pipeline {
         let mut count = 0;
 
         while let Some(frame) = source.next_frame() {
-            if let Some(max) = max_frames {
-                if count >= max {
+            if let Some(max) = max_frames
+                && count >= max {
                     break;
                 }
-            }
             let processed_frame = self.process_frame(frame);
             sink.write(&processed_frame)?;
             count += 1;

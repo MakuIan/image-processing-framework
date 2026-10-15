@@ -2,8 +2,9 @@
 
 use clap::Parser;
 use image_processing_framework::{
-    FilterConfig, ImageSink, ImageSource, Pipeline, Sink, Source, VideoEncoder, VideoSink,
-    VideoSource, calculate_psnr, calculate_ssim, generate_diff_map,
+    FilterConfig, ImageSink, ImageSource, Pipeline, Sink, SomVideoConfig, Source, VideoEncoder,
+    VideoSink, VideoSource, calculate_psnr, calculate_ssim, decode_video_stream,
+    encode_video_stream, generate_diff_map,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -74,6 +75,27 @@ struct Cli {
     /// GPU-Compute-Shader (wgpu) für Filter verwenden (AMD/Nvidia/Intel)
     #[arg(long)]
     gpu: bool,
+
+    // --- SOM Video Kompression Flags ---
+    /// Aktiviert das SOM-Kompressionsexperiment für Videos
+    #[arg(long)]
+    som: bool,
+
+    /// Kantenlänge der quadratischen Kacheln / Blöcke (Standard: 4 für 4x4)
+    #[arg(long, default_value_t = 4)]
+    som_block_size: usize,
+
+    /// Gittergröße des SOM (Standard: 16 -> 16x16 = 256 Neuronen, alternativ z. B. 8 -> 64)
+    #[arg(long, default_value_t = 16)]
+    som_grid: usize,
+
+    /// PSNR-Schwellenwert in dB für Keyframe-Generierung (Standard: 28.0 dB)
+    #[arg(long, default_value_t = 28.0)]
+    som_threshold: f64,
+
+    /// Anzahl der Trainings-Epochen pro Keyframe (Standard: 5)
+    #[arg(long, default_value_t = 5)]
+    som_epochs: usize,
 }
 
 /// Klassifiziert die Eingabedatei anhand ihrer Dateiendung
@@ -279,6 +301,146 @@ fn run_image_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Führt das SOM-Video-Kompressionsexperiment durch
+fn run_som_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let input_path = &cli.input;
+    if !input_path.is_file() {
+        eprintln!("Fehler: Eingabedatei {:?} nicht gefunden!", input_path);
+        return Err("Input file not found".into());
+    }
+
+    let output_path = match &cli.output {
+        Some(p) => p.clone(),
+        None => auto_output_path(input_path),
+    };
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    println!("=== SOM-Video-Kompressionsexperiment ===\n");
+    println!("Input:  {:?}", input_path);
+    println!("Output: {:?}", output_path);
+
+    let config = SomVideoConfig::new(
+        cli.som_block_size,
+        cli.som_grid,
+        cli.som_threshold,
+        cli.som_epochs,
+    );
+
+    println!("Codec-Konfiguration:");
+    println!(
+        "  Blockgröße:          {}x{} Pixel",
+        config.block_size, config.block_size
+    );
+    println!(
+        "  SOM-Gitter:          {}x{} ({} Neuronen)",
+        config.som_grid_size,
+        config.som_grid_size,
+        config.som_grid_size * config.som_grid_size
+    );
+    println!("  PSNR-Schwellenwert:  {:.1} dB", config.psnr_threshold_db);
+    println!("  Kohonen-Epochen:     {}", config.train_epochs);
+
+    println!("\nStep 1: Frames aus Video laden...");
+    let mut source = VideoSource::new(input_path)?;
+    let fps = source.fps();
+    let width = source.width();
+    let height = source.height();
+
+    let mut raw_frames = Vec::new();
+    while let Some(frame) = source.next_frame() {
+        raw_frames.push(frame);
+        if let Some(limit) = cli.max_frames {
+            if raw_frames.len() >= limit {
+                break;
+            }
+        }
+    }
+    source.release();
+
+    if raw_frames.is_empty() {
+        return Err("Keine Frames im Video gefunden".into());
+    }
+    println!(
+        "  {} Frame(s) geladen ({}x{} @ {:.2} FPS)",
+        raw_frames.len(),
+        width,
+        height,
+        fps
+    );
+
+    println!("\nStep 2: SOM-Kompression durchführen (Intra- & Inter-Frame Redundanz)...");
+    let pb = ProgressBar::new(raw_frames.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] [{bar:30.cyan/blue}] {pos}/{len} Frames ({per_sec})")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("#>-"),
+    );
+
+    let result = encode_video_stream(&raw_frames, &config);
+    pb.finish_and_clear();
+
+    println!("\n=== Kompressions- & Qualitäts-Statistik ===");
+    println!("  Verarbeitete Frames:      {}", result.stats.total_frames);
+    println!(
+        "  Keyframes generiert:      {} ({:.1}% aller Frames)",
+        result.stats.keyframe_count,
+        (result.stats.keyframe_count as f64 / result.stats.total_frames as f64) * 100.0
+    );
+    println!(
+        "  Durchschnittliche PSNR:   {:.2} dB",
+        result.stats.avg_psnr_db
+    );
+    println!(
+        "  Rohdaten-Größe:           {:.2} MB ({} Bytes)",
+        result.stats.raw_size as f64 / 1_048_576.0,
+        result.stats.raw_size
+    );
+    println!(
+        "  Komprimierte Index-Größe: {:.2} KB ({} Bytes)",
+        result.stats.compressed_size as f64 / 1_024.0,
+        result.stats.compressed_size
+    );
+    println!(
+        "  Kompressionsfaktor (CR):  {:.2} : 1",
+        result.stats.compression_ratio
+    );
+
+    println!("\nStep 3: Dekodiere Videostrom & schreibe Ausgabevideo zur Qualitätsprüfung...");
+    let decoded_frames = decode_video_stream(&result.frames, width, height, &config, fps)
+        .map_err(|e| format!("Fehler beim Dekodieren: {}", e))?;
+
+    // Berechne durchschnittlichen SSIM über alle dekodierten Frames
+    let mut total_ssim = 0.0;
+    for (orig, dec) in raw_frames.iter().zip(decoded_frames.iter()) {
+        total_ssim += calculate_ssim(orig, dec);
+    }
+    let avg_ssim = total_ssim / raw_frames.len() as f64;
+    println!("  Durchschnittlicher SSIM:  {:.4}", avg_ssim);
+
+    // Ausgabe-Video via FFmpeg schreiben
+    let encoder = VideoEncoder::from_str_loose(&cli.encoder);
+    let mut sink = VideoSink::new(&output_path, fps as f32).with_encoder(encoder);
+    for frame in &decoded_frames {
+        sink.write(frame)?;
+    }
+    sink.release();
+
+    if output_path.is_file() {
+        let meta = std::fs::metadata(&output_path)?;
+        println!(
+            "  Rekonstruiertes Video:    {:?} ({} Bytes)",
+            output_path,
+            meta.len()
+        );
+    }
+
+    println!("\n=== SOM-Kompression erfolgreich abgeschlossen ===");
+    Ok(())
+}
+
 /// Führt die Video-Pipeline für eine einzelne Eingabedatei durch
 fn run_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let input_path = &cli.input;
@@ -391,7 +553,15 @@ fn main() {
             }
         }
         InputKind::Video => {
-            if let Err(e) = run_video_pipeline(&cli) {
+            if cli.som {
+                if let Err(e) = run_som_video_pipeline(&cli) {
+                    eprintln!("SOM-Video-Pipeline fehlgeschlagen: {}", e);
+                    eprintln!(
+                        "Hinweis: Stelle sicher, dass 'ffmpeg' und 'ffprobe' installiert sind."
+                    );
+                    std::process::exit(1);
+                }
+            } else if let Err(e) = run_video_pipeline(&cli) {
                 eprintln!("Video-Pipeline fehlgeschlagen: {}", e);
                 eprintln!("Hinweis: Stelle sicher, dass 'ffmpeg' und 'ffprobe' installiert sind.");
                 std::process::exit(1);

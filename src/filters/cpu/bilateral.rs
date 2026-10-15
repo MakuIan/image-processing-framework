@@ -93,10 +93,8 @@ pub fn apply_bilateral_cpu(
                 let out_idx = x * 3;
                 if sum_weights > 0.0 {
                     row_out[out_idx] = (sum_r / sum_weights).round().clamp(0.0, 255.0) as u8;
-                    row_out[out_idx + 1] =
-                        (sum_g / sum_weights).round().clamp(0.0, 255.0) as u8;
-                    row_out[out_idx + 2] =
-                        (sum_b / sum_weights).round().clamp(0.0, 255.0) as u8;
+                    row_out[out_idx + 1] = (sum_g / sum_weights).round().clamp(0.0, 255.0) as u8;
+                    row_out[out_idx + 2] = (sum_b / sum_weights).round().clamp(0.0, 255.0) as u8;
                 } else {
                     row_out[out_idx] = center_r as u8;
                     row_out[out_idx + 1] = center_g as u8;
@@ -134,10 +132,9 @@ impl BilateralFilter {
 
         // Maximaler Farbabstand im RGB-Raum: 3 * 255^2 = 195.075
         let max_color_dist = 3 * 255 * 255;
-        let mut color_lut = vec![0.0f64; max_color_dist + 1];
-        for d in 0..=max_color_dist {
-            color_lut[d] = gaussian_weight(d as f64, sigma_color);
-        }
+        let color_lut = (0..=max_color_dist)
+            .map(|d| gaussian_weight(d as f64, sigma_color))
+            .collect();
 
         Self {
             radius,

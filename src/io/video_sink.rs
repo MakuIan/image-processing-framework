@@ -150,15 +150,13 @@ impl VideoSink {
         cmd.stderr(std::process::Stdio::null());
 
         let mut child = cmd.spawn().map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
+            std::io::Error::other(
                 format!("FFmpeg-Prozess start fehlgeschlagen: {}", e),
             )
         })?;
 
         let stdin = child.stdin.take().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
+            std::io::Error::other(
                 "Konnte stdin von FFmpeg-Prozess nicht öffnen",
             )
         })?;

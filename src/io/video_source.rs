@@ -86,15 +86,13 @@ impl VideoSource {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                std::io::Error::other(
                     format!("FFmpeg-Prozess start fehlgeschlagen: {}", e),
                 )
             })?;
 
         let stdout = child.stdout.take().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
+            std::io::Error::other(
                 "Konnte stdout von FFmpeg-Process nicht lesen",
             )
         })?;
@@ -145,7 +143,7 @@ impl VideoSource {
             ])
             .output()
             .map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, format!("ffprobe Fehler: {}", e))
+                std::io::Error::other(format!("ffprobe Fehler: {}", e))
             })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);

@@ -1,6 +1,6 @@
 ﻿# Image Processing Framework
 
-Ein hochperformantes Framework zur Bild- und Videoverarbeitung in **Rust** mit modularer Streaming-Pipeline, CPU-Multithreading via [Rayon](https://crates.io/crates/rayon) und GPU-Compute-Shader-Beschleunigung via [wgpu](https://crates.io/crates/wgpu) (Vulkan / DirectX 12 / Metal).
+Ein hochperformantes Framework zur Bild- und Videoverarbeitung in **Rust** mit modularer Streaming-Pipeline, CPU-Multithreading via [Rayon](https://crates.io/crates/rayon), GPU-Compute-Shader-Beschleunigung via [wgpu](https://crates.io/crates/wgpu) (Vulkan / DirectX 12 / Metal) und **SOM-basierter Videokompression** (Kohonen Self-Organizing Maps, Vektorquantisierung und Entropiekodierung).
 
 ---
 
@@ -10,9 +10,11 @@ Ein hochperformantes Framework zur Bild- und Videoverarbeitung in **Rust** mit m
 - [Projekt- & Modulstruktur](#projekt---modulstruktur)
 - [Framework starten](#framework-starten)
 - [CLI-Referenz](#cli-referenz)
+- [SOM-Videokompression (Neuronale Vektorquantisierung)](#som-videokompression-neuronale-vektorquantisierung)
 - [Praxisbeispiele](#praxisbeispiele)
   - [Bildverarbeitung](#bildverarbeitung)
-  - [Videoverarbeitung](#videoverarbeitung)
+  - [Videoverarbeitung & Filter](#videoverarbeitung--filter)
+  - [SOM-Videokompression & Qualitätsuntersuchung](#som-videokompression--qualitätsuntersuchung)
 - [Filter, Architektur & Qualitätsmetriken](#filter-architektur--qualitätsmetriken)
 
 ---
@@ -113,7 +115,7 @@ cargo run --release -- <INPUT> [OPTIONEN]
 | :--- | :--- | :--- |
 | `<INPUT>` | Pfad (Pflicht) | Pfad zur Eingabedatei (Bild oder Video). Beispiel: `assets/input/test_input.png` |
 
-### Optionen & Flags
+### Allgemeine Optionen & Filter
 | Option / Flag | Standardwert | Beschreibung |
 | :--- | :--- | :--- |
 | `-o`, `--output <PFAD>` | `assets/output/<stem>_processed.<ext>` | Individueller Zielpfad für die Ausgabedatei. |
@@ -138,18 +140,77 @@ cargo run --release -- <INPUT> [OPTIONEN]
 > - **Filter explizit auswählen:** Sobald mindestens ein Filter oder ein Filterparameter gesetzt wird (z. B. `--blur` oder `--noise-sigma 20.0`), werden **nur** die ausgewählten Filter ausgeführt.
 > - **Implizite Aktivierung:** Ein Parameter wie `--blur-sigma 2.5` aktiviert den Blur-Filter automatisch, ohne dass man zwingend zusätzlich `--blur` angeben muss.
 
+### SOM-Kompression (Videoverfahren)
+| Option / Flag | Standardwert | Beschreibung |
+| :--- | :--- | :--- |
+| `--som` | `false` | Aktiviert das neuronale SOM-Kompressionsexperiment für Videos. |
+| `--som-block-size <INT>` | `4` | Kantenlänge quadratischer Kacheln (z. B. `4` für 4x4 oder `8` für 8x8 Pixel). |
+| `--som-grid <INT>` | `16` | Gittergröße des SOM (z. B. `16` für 16x16 = 256 Neuronen, oder `8` für 64 Neuronen). |
+| `--som-threshold <FLOAT>`| `28.0` | PSNR-Schwellenwert in dB. Unterschreitet ein Folgeframe diese Qualität, wird ein neuer Keyframe trainiert. |
+| `--som-epochs <INT>` | `5` | Anzahl der Kohonen-Trainings-Epochen pro Keyframe. |
+
+---
+
+## SOM-Videokompression (Neuronale Vektorquantisierung)
+
+Das Modul nutzt ein klassisches Verfahren der neuronalen Bild- und Videokompression zur Reduktion von Redundanzen:
+
+1. **Räumliche Redundanz (Intra-Frame):**  
+   Bilder werden in Kacheln zerlegt (z. B. 4x4 Pixel mit 3 Kanälen = 48 Dimensionen). Ein zweidimensionales Kohonen-Gitter (SOM) lernt ein repräsentatives Codebuch. Jeder Block wird durch die Best Matching Unit (BMU) approximiert und als 1-Byte-Index (`u8`) dargestellt.
+2. **Topologische Ordnung & Entropiekodierung:**  
+   Da Nachbarneuronen ähnliche Bildmuster darstellen, weisen die quantisierten Blockindizes hohe lokale Redundanz auf. Diese wird durch **Run-Length-Encoding (RLE)** und anschließende **Deflate-Kompression (`flate2`)** verlustfrei komprimiert.
+3. **Zeitliche Redundanz & Keyframe-Entscheidung (Inter-Frame):**  
+   Frame 0 startet als Keyframe mit neu trainiertem Codebuch. Für jeden Folgeframe wird das bestehende Codebuch getestet:
+   - Erreicht die Rekonstruktion mindestens den Schwellenwert (z. B. `28.0 dB` PSNR), wird das SOM beibehalten und nur der kompakte Index-Datenstrom übertragen.
+   - Sinkt die Qualität (z. B. durch Szenenwechsel oder starke Bewegung), wird ein neuer Keyframe getriggert, ein neues SOM trainiert und die Codebuch-Gewichte übertragen.
+
+---
+
+## Praxisbeispiele
+
+### Bildverarbeitung
+```powershell
+# Bild mit Standard-Pipeline filtern
+cargo run --release -- assets/input/test.png
+
+# Bild mit spezifischem Rausch- und Glättungsfilter
+cargo run --release -- assets/input/test.png --noise-sigma 20.0 --bilateral-radius 5
+```
+
+### Videoverarbeitung & Filter
+```powershell
+# Erste 60 Frames eines Videos filtern
+cargo run --release -- assets/input/video.mp4 --max-frames 60 --blur-sigma 2.0
+```
+
+### SOM-Videokompression & Qualitätsuntersuchung
+
+```powershell
+# Standard-Kompression (4x4 Blöcke, 16x16 SOM = 256 Neuronen, 28 dB Schwelle)
+cargo run --release -- assets/input/video.mp4 --som --max-frames 30
+
+# Schnelleres Training mit kleinerem Codebuch (8x8 SOM = 64 Neuronen)
+cargo run --release -- assets/input/video.mp4 --som --som-grid 8 --max-frames 30
+
+# Größere Kacheln (8x8 Blöcke) für höhere Kompression bei geringerer Detailtreue
+cargo run --release -- assets/input/video.mp4 --som --som-block-size 8 --max-frames 30
+
+# Strengere Qualitätsschwelle (32 dB -> führt zu mehr Keyframes bei Szenenwechseln)
+cargo run --release -- assets/input/video.mp4 --som --som-threshold 32.0 --max-frames 30
+```
+
 ---
 
 ## Filter, Architektur & Qualitätsmetriken
 
 ### Enthaltene Filter
-1. **Gaussian Noise Filter** (`GaussianNoiseFilter` / `GpuGaussianNoiseFilter`):
+1. **Gaussian Noise Filter** (`GaussianNoiseFilter` / `GpuGaussianNoiseFilter`):  
    Fügt normalverteiltes Zufallsrauschen hinzu. Auf der CPU via Box-Muller-Transformation, auf der GPU via WGSL-Hash & Box-Muller Compute-Shader.
-2. **Bilateral Filter** (`BilateralFilter` / `GpuBilateralFilter`):
+2. **Bilateral Filter** (`BilateralFilter` / `GpuBilateralFilter`):  
    Glättet Oberflächenrauschen unter Erhaltung harter Kanten.
    - **CPU:** Berechnet vorab eine Look-Up-Table (LUT) für Farbgewichte und verteilt die Zeilen via Rayon.
    - **GPU:** 2D-Workgroup-Compute-Shader (16 × 16), bei dem Pixel parallel in Hardware berechnet werden.
-3. **Gaussian Blur Filter** (`BlurFilter` / `GpuBlurFilter`):
+3. **Gaussian Blur Filter** (`BlurFilter` / `GpuBlurFilter`):  
    Klassischer Gaußscher Weichzeichner.
 
 ### Zentrale Standardwerte (`FilterConfig`)
@@ -162,7 +223,8 @@ Alle Standardwerte sind zentral in `src/filters/config.rs` als Konstanten defini
 - `DEFAULT_BLUR_SIGMA = 1.0`
 
 ### Evaluierung & Qualitätsmetriken
-Bei Bildern berechnet das Framework automatisch:
+Das Framework berechnet automatisch etablierte Maße zur Bewertung der Übertragungs- und Rekonstruktionsqualität:
 - **PSNR (Peak Signal-to-Noise Ratio):** Maß für den Signal-zu-Rausch-Abstand in Dezibel (dB).
-- **SSIM (Structural Similarity Index):** Strukturelle Ähnlichkeit zwischen Original und Ergebnis (0.0 bis 1.0).
-- **Differenz-Heatmap (`*_diff_heatmap.png`):** Farbkodierte Abweichungskarte (Schwarz/Blau = identisch, Rot/Gelb = hohe Abweichung).
+- **SSIM (Structural Similarity Index):** Strukturelle Ähnlichkeit zwischen Original und Ergebnis bzw. rekonstruiertem Frame (0.0 bis 1.0).
+- **Kompressionsfaktor (CR):** Verhältnis zwischen Rohdaten-Bytegröße und komprimierter Index-Bytegröße (`CR = Raw / Compressed`).
+- **Diff-Heatmap (`*_diff_heatmap.png`):** Farbkodierte Abweichungskarte bei Einzelbildern (Schwarz/Blau = identisch, Rot/Gelb = hohe Abweichung).

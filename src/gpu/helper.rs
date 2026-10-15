@@ -93,7 +93,7 @@ impl GpuComputeHelper {
             usage: wgpu::BufferUsages::STORAGE,
         });
 
-        let output_bytes_len = (input.len() * std::mem::size_of::<u32>()) as u64;
+        let output_bytes_len = std::mem::size_of_val(input) as u64;
         let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("OutputBuffer"),
             size: output_bytes_len,
@@ -138,8 +138,8 @@ impl GpuComputeHelper {
             });
             compute_pass.set_pipeline(&self.pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
-            let workgroups_x = (width + 15) / 16;
-            let workgroups_y = (height + 15) / 16;
+            let workgroups_x = width.div_ceil(16);
+            let workgroups_y = height.div_ceil(16);
             compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
 
