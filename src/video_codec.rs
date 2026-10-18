@@ -37,6 +37,7 @@ use crate::block::{
 use crate::compression::{compress_indices, decompress_indices};
 use crate::evaluator::calculate_psnr;
 use crate::frame::Frame;
+use crate::gpu::SomGpuQuantizer;
 use crate::matrix::SomMatrix;
 use image::RgbImage;
 
@@ -77,6 +78,11 @@ pub struct SomVideoConfig {
     pub psnr_relative_margin_db: f64,
     /// Anzahl der Kohonen-Epochen beim Training (Standard: `5`).
     pub train_epochs: usize,
+    /// `true`, wenn die Block-Quantisierung auf der GPU (wgpu Compute
+    /// Shader) ausgefuehrt werden soll - analog zum `--gpu`-Flag der
+    /// Filter (Standard: `false`). Training und Dekodierung bleiben CPU;
+    /// ohne GPU-Adapter faellt der Encoder still auf die CPU zurueck.
+    pub gpu: bool,
 }
 
 impl Default for SomVideoConfig {
@@ -87,6 +93,7 @@ impl Default for SomVideoConfig {
             psnr_threshold_db: 28.0,
             psnr_relative_margin_db: DEFAULT_PSNR_RELATIVE_MARGIN_DB,
             train_epochs: 5,
+            gpu: false,
         }
     }
 }
@@ -105,12 +112,19 @@ impl SomVideoConfig {
             psnr_threshold_db,
             psnr_relative_margin_db: DEFAULT_PSNR_RELATIVE_MARGIN_DB,
             train_epochs,
+            gpu: false,
         }
     }
 
     /// Setzt das Toleranzband der relativen Keyframe-Erkennung (dB).
     pub fn with_psnr_relative_margin(mut self, margin_db: f64) -> Self {
         self.psnr_relative_margin_db = margin_db;
+        self
+    }
+
+    /// Aktiviert bzw. deaktiviert die GPU-Quantisierung (wgpu).
+    pub fn with_gpu(mut self, gpu: bool) -> Self {
+        self.gpu = gpu;
         self
     }
 }
@@ -296,6 +310,35 @@ fn effective_threshold(absolute: f64, baseline: f64, margin: f64) -> f64 {
     }
 }
 
+/// Flacht die Codebuch-Gewichte in ein zeilenmajores `f32`-Array ab
+/// (Reihenfolge wie [`SomMatrix::weights`]). Dieses Layout entspricht dem
+/// Speicheraufbau, den der GPU-Quantisierer erwartet und den
+/// `SomMatrix::quantize_all_flat` sich pro Aufruf selbst spiegelt.
+fn flatten_weights(som: &SomMatrix) -> Vec<f32> {
+    som.weights.iter().flatten().copied().collect()
+}
+
+/// Dispatch-Stelle zwischen GPU- und CPU-Quantisierung: Der GPU-Pfad ist
+/// reiner Beschleuniger, ohne Adapter greift unveraendert die CPU-Referenz
+/// (`quantize_all_flat`, AVX2 + Rayon). Training und Dekodierung sind
+/// nicht betroffen.
+fn quantize_blocks(
+    som: &SomMatrix,
+    blocks: &BlockBuffer,
+    weights_flat: &[f32],
+    gpu: Option<&SomGpuQuantizer>,
+) -> Vec<u8> {
+    debug_assert_eq!(
+        weights_flat.len(),
+        som.neuron_count() * som.vector_dim,
+        "flat weights must describe the current codebook"
+    );
+    match gpu {
+        Some(quantizer) => quantizer.quantize_flat(weights_flat, blocks),
+        None => som.quantize_all_flat(blocks),
+    }
+}
+
 /// Einkodiert einen Frame-Stream gemÃ¤ÃŸ `config`.
 ///
 /// Siehe Modul-Dokumentation fÃ¼r den Keyframe-Algorithmus. FÃ¼r jeden
@@ -352,6 +395,26 @@ pub fn encode_video_stream_with_progress<F: FnMut(EncodeFrameProgress)>(
 
     let block_config = BlockConfig::new(config.block_size, 3);
 
+    // Optionaler GPU-Pfad (Stufe 2): Der Quantizer wird einmalig pro Stream
+    // aufgebaut; ohne Adapter faellt der Encode-Loop unveraendert auf die
+    // CPU-Referenz zurueck.
+    let gpu_quantizer = if config.gpu {
+        SomGpuQuantizer::new()
+    } else {
+        None
+    };
+    if config.gpu && gpu_quantizer.is_none() {
+        eprintln!(
+            "Warnung: GPU-Quantisierung angefordert, aber kein GPU-Adapter verfuegbar. \
+             Fallback auf CPU."
+        );
+    }
+
+    // Flache Gewichte des aktuellen Codebooks (zeilenmajor): Speicherlayout
+    // fuer den GPU-Quantisierer. Wird nur bei neuem Codebook (Keyframe)
+    // neu aufgebaut und bei Interframes wiederverwendet.
+    let mut weights_flat: Vec<f32> = Vec::new();
+
     // Codebook-Zustand: existiert erst ab dem ersten Keyframe (Frame 0).
     // `baseline_psnr` merkt sich die Qualitaet, die das aktuelle Codebook
     // beim Trainieren des letzten Keyframes geliefert hat; sie ist die
@@ -386,14 +449,15 @@ pub fn encode_video_stream_with_progress<F: FnMut(EncodeFrameProgress)>(
                 config.som_grid_size,
                 config.train_epochs,
             );
-            indices = trained.quantize_all_flat(&blocks);
+            weights_flat = flatten_weights(&trained);
+            indices = quantize_blocks(&trained, &blocks, &weights_flat, gpu_quantizer.as_ref());
             frame_psnr = psnr_from_indices(frame, &trained, &indices, &block_config);
             baseline_psnr = frame_psnr;
             som = Some(trained);
         } else {
             // Testweise Rekonstruktion mit der bisherigen SOM.
             let current = som.as_ref().expect("codebook exists after frame 0");
-            indices = current.quantize_all_flat(&blocks);
+            indices = quantize_blocks(current, &blocks, &weights_flat, gpu_quantizer.as_ref());
             frame_psnr = psnr_from_indices(frame, current, &indices, &block_config);
 
             let threshold = effective_threshold(
@@ -413,7 +477,9 @@ pub fn encode_video_stream_with_progress<F: FnMut(EncodeFrameProgress)>(
                     config.som_grid_size,
                     config.train_epochs,
                 );
-                indices = trained.quantize_all_flat(&blocks);
+                weights_flat = flatten_weights(&trained);
+                indices =
+                    quantize_blocks(&trained, &blocks, &weights_flat, gpu_quantizer.as_ref());
                 frame_psnr = psnr_from_indices(frame, &trained, &indices, &block_config);
                 baseline_psnr = frame_psnr;
                 som = Some(trained);
@@ -753,6 +819,56 @@ mod tests {
         let small = extract_blocks_flat(&data[..16 * 16 * 3], 16, 16, &block_config);
         assert_eq!(small.len(), 16);
         assert_eq!(subsample_for_training(&small).len(), 16);
+    }
+
+    #[test]
+    fn gpu_flag_defaults_off_and_is_builder_settable() {
+        assert!(!SomVideoConfig::default().gpu);
+        assert!(!SomVideoConfig::new(4, 16, 28.0, 5).gpu);
+        assert!(SomVideoConfig::default().with_gpu(true).gpu);
+        assert!(!SomVideoConfig::default().with_gpu(true).with_gpu(false).gpu);
+    }
+
+    #[test]
+    fn quantize_blocks_without_gpu_matches_cpu_reference() {
+        let frame = make_frame(0, 0);
+        let block_config = BlockConfig::new(4, 3);
+        let blocks = extract_blocks_flat(
+            frame_pixels(&frame),
+            frame.width(),
+            frame.height(),
+            &block_config,
+        );
+        let samples: Vec<Vec<f32>> = blocks.blocks().map(|b| b.to_vec()).collect();
+        let mut som = SomMatrix::new(4, 4, block_config.block_dim(), &samples);
+        som.train(&samples, 2, 0.3);
+
+        let weights_flat = flatten_weights(&som);
+        assert_eq!(weights_flat.len(), som.neuron_count() * som.vector_dim);
+        // Ohne GPU-Quantizer ist der Dispatch exakt die CPU-Referenz.
+        assert_eq!(
+            quantize_blocks(&som, &blocks, &weights_flat, None),
+            som.quantize_all_flat(&blocks)
+        );
+    }
+
+    #[test]
+    fn encode_stream_with_gpu_request_produces_valid_stream() {
+        // Fordert den GPU-Pfad an: ohne Adapter warnt der Encoder und faellt
+        // auf die CPU zurueck, mit Adapter rechnet der Quantizer auf der GPU.
+        let frames = vec![make_frame(0, 0), make_frame(1, 10)];
+        let config = default_config().with_gpu(true);
+
+        let result = encode_video_stream(&frames, &config);
+        assert_eq!(result.frames.len(), frames.len());
+        assert!(result.frames[0].is_keyframe);
+
+        let decoded =
+            decode_video_stream(&result.frames, 16, 16, &config, 30.0).expect("decoding must succeed");
+        for (original, decoded_frame) in frames.iter().zip(decoded.iter()) {
+            let psnr = calculate_psnr(original, decoded_frame);
+            assert!(psnr > 20.0 || psnr == f64::INFINITY);
+        }
     }
 
     #[test]

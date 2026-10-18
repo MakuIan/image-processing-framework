@@ -1,10 +1,12 @@
 ﻿pub mod conversion;
 pub mod helper;
+pub mod som;
 
 use std::sync::{Arc, OnceLock};
 
 pub use conversion::{frame_to_rgba_u32, rgba_u32_to_frame};
 pub use helper::GpuComputeHelper;
+pub use som::SomGpuQuantizer;
 
 pub static GPU_CONTEXT: OnceLock<Option<Arc<GpuContext>>> = OnceLock::new();
 
@@ -56,12 +58,15 @@ mod tests {
 
     #[test]
     fn test_gpu_context_creation() {
-        match GpuContext::new() { Some(ctx) => {
-            println!("GPU Adapter Name: {}", ctx.adapter_info.name);
-            println!("GPU Backend: {:?}", ctx.adapter_info.backend);
-            println!("GPU Driver: {}", ctx.adapter_info.driver);
-        } _ => {
-            println!("No GPU adapter found (headless or not supported)");
-        }}
+        match GpuContext::new() {
+            Some(ctx) => {
+                println!("GPU Adapter Name: {}", ctx.adapter_info.name);
+                println!("GPU Backend: {:?}", ctx.adapter_info.backend);
+                println!("GPU Driver: {}", ctx.adapter_info.driver);
+            }
+            _ => {
+                println!("No GPU adapter found (headless or not supported)");
+            }
+        }
     }
 }

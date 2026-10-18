@@ -119,7 +119,7 @@ cargo run --release -- <INPUT> [OPTIONEN]
 | Option / Flag | Standardwert | Beschreibung |
 | :--- | :--- | :--- |
 | `-o`, `--output <PFAD>` | `assets/output/<stem>_processed.<ext>` | Individueller Zielpfad für die Ausgabedatei. |
-| `--gpu` | `false` (CPU-Modus) | Aktiviert **wgpu Compute-Shader** auf der GPU (Vulkan / DX12 / Metal). Standardmäßig rechnet die CPU parallel via Rayon. |
+| `--gpu` | `false` (CPU-Modus) | Aktiviert **wgpu Compute-Shader** auf der GPU (Vulkan / DX12 / Metal) - für die **Filter** und für die **SOM-Block-Quantisierung** (nur bei `--som`). Standardmäßig rechnet die CPU parallel via Rayon; ohne GPU-Adapter erfolgt automatisch der CPU-Fallback. |
 | `--noise` | `false` | Wendet Gaussian-Noise (normalverteiltes Rauschen) an. |
 | `--noise-sigma <FLOAT>` | `15.0` | Standardabweichung / Stärke des Rauschens. |
 | `--noise-mean <FLOAT>` | `0.0` | Mittelwert des Rauschens. |
@@ -150,6 +150,15 @@ cargo run --release -- <INPUT> [OPTIONEN]
 | `--som-grid <INT>` | `16` | Gittergröße des SOM (z. B. `16` für 16x16 = 256 Neuronen, oder `8` für 64 Neuronen). |
 | `--som-threshold <FLOAT>`| `28.0` | PSNR-Schwellenwert in dB. Unterschreitet ein Folgeframe diese Qualität, wird ein neuer Keyframe trainiert. Ist die Schwelle für das Material unerreichbar, senkt sie sich automatisch relativ zum letzten Keyframe ab (Toleranz 2.5 dB); `inf` erzwingt jeden Frame als Keyframe. |
 | `--som-epochs <INT>` | `5` | Anzahl der Kohonen-Trainings-Epochen pro Keyframe (mit repräsentativem Subsampling: max. 10.000 Blöcke pro Training). |
+
+> [!NOTE]
+> **GPU-Modus beim SOM-Verfahren:** Mit `--gpu` läuft die heisse
+> Block-Quantisierung (BMU-Suche über alle Blöcke × Neuronen) als
+> wgpu-Compute-Shader statt auf CPU (AVX2 + Rayon) - typischerweise der
+> größte Teil der Interframe-Latenz. **Training und Dekodierung bleiben auf
+> der CPU**, und ohne GPU-Adapter fällt der Encoder automatisch auf die
+> CPU-Referenz zurück (Determinismus und Ergebnisqualität bleiben
+> erhalten).
 
 ---
 

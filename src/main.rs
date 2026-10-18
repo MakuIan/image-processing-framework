@@ -81,7 +81,7 @@ struct Cli {
     #[arg(long)]
     max_frames: Option<usize>,
 
-    /// GPU-Compute-Shader (wgpu) fuer Filter verwenden (AMD/Nvidia/Intel)
+    /// GPU-Compute-Shader (wgpu) fuer Filter und SOM-Quantisierung verwenden (AMD/Nvidia/Intel)
     #[arg(long)]
     gpu: bool,
 
@@ -360,9 +360,15 @@ fn run_som_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         cli.som_grid,
         cli.som_threshold,
         cli.som_epochs,
-    );
+    )
+    .with_gpu(cli.gpu);
 
     println!("Codec-Konfiguration:");
+    if config.gpu {
+        println!("  SOM-Modus:            GPU-Beschleunigung aktiv (wgpu)");
+    } else {
+        println!("  SOM-Modus:            CPU (SIMD + Rayon)");
+    }
     println!(
         "  Blockgroesse:         {}x{} Pixel",
         config.block_size, config.block_size

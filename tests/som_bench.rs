@@ -1,9 +1,240 @@
 use image::RgbImage;
 use image_processing_framework::{
-    BlockConfig, Frame, SomMatrix, SomVideoConfig, calculate_psnr, compress_indices,
-    encode_video_stream_with_progress, extract_blocks_flat, reconstruct_image_from_codebook,
+    BlockBuffer, BlockConfig, Frame, SomGpuQuantizer, SomMatrix, SomVideoConfig, calculate_psnr,
+    compress_indices, decode_video_stream, decompress_indices, deserialize_som,
+    encode_video_stream, encode_video_stream_with_progress, extract_blocks_flat,
+    reconstruct_image_from_codebook,
 };
 use std::time::Instant;
+
+/// Liefert den GPU-Quantizer oder `None` ohne Adapter: Der Test wird dann
+/// uebersprungen, damit die Suite auch headless gruen bleibt.
+fn gpu_quantizer_or_skip() -> Option<SomGpuQuantizer> {
+    match SomGpuQuantizer::new() {
+        Some(quantizer) => Some(quantizer),
+        None => {
+            println!("kein GPU-Adapter - GPU-Test uebersprungen");
+            None
+        }
+    }
+}
+
+/// Deterministisches SOM plus Bloecke mit disjunkten Minima: Jeder Block
+/// ist exakt eine Gewichtszeile (Distanz 0.0) oder eine davon minimal
+/// gestoerte Variante. CPU und GPU muessen bit-identisch entscheiden.
+fn disjoint_fixture(grid: usize) -> (SomMatrix, BlockBuffer) {
+    let dim = 48usize;
+    let neuron_count = grid * grid;
+    let som = SomMatrix {
+        grid_width: grid,
+        grid_height: grid,
+        vector_dim: dim,
+        weights: (0..neuron_count)
+            .map(|i| {
+                (0..dim)
+                    .map(|d| ((i * 31 + d * 7) % 251) as f32 / 255.0)
+                    .collect()
+            })
+            .collect(),
+    };
+
+    let mut data: Vec<f32> = Vec::with_capacity((neuron_count + 32) * dim);
+    for weight in &som.weights {
+        data.extend_from_slice(weight);
+    }
+    for k in 0..32 {
+        let mut block = som.weights[(k * 13) % neuron_count].clone();
+        block[k % dim] += 0.001;
+        data.extend_from_slice(&block);
+    }
+
+    let blocks = BlockBuffer::new(data, dim);
+    (som, blocks)
+}
+
+/// GPU-vs-CPU-Aequivalenz auf Disjunkten-Minima-Fixtures: bit-identische
+/// Indizes (inkl. inaktiver Lanes bei 8x8-Gittern und Tie-Break).
+#[test]
+fn gpu_quantize_matches_cpu_on_disjoint_minima() {
+    let Some(gpu) = gpu_quantizer_or_skip() else {
+        return;
+    };
+
+    for grid in [8usize, 16] {
+        let (som, blocks) = disjoint_fixture(grid);
+        let weights_flat: Vec<f32> = som.weights.iter().flatten().copied().collect();
+
+        let cpu = som.quantize_all_flat(&blocks);
+        let gpu_indices = gpu.quantize_flat(&weights_flat, &blocks);
+
+        assert_eq!(gpu_indices.len(), cpu.len(), "grid {grid}x{grid}");
+        assert_eq!(gpu_indices, cpu, "grid {grid}x{grid}");
+    }
+}
+
+/// Zufaellige Bloecke: alle Indizes liegen im Codebook, und die
+/// Rekonstruktionsqualitaet (PSNR) von GPU- und CPU-Indizes weicht um
+/// weniger als 1e-3 dB voneinander ab.
+#[test]
+fn gpu_quantize_reconstruction_matches_cpu_psnr() {
+    let Some(gpu) = gpu_quantizer_or_skip() else {
+        return;
+    };
+
+    let (width, height) = (64u32, 64u32);
+    let data: Vec<u8> = (0..(width * height * 3) as usize)
+        .map(|i| ((i * 37 + (i >> 5) * 11 + 3) % 256) as u8)
+        .collect();
+    let original = Frame::new(
+        RgbImage::from_raw(width, height, data.clone()).expect("64x64 frame buffer"),
+        0,
+        0.0,
+    );
+
+    let block_config = BlockConfig::new(4, 3);
+    let blocks = extract_blocks_flat(&data, width, height, &block_config);
+    let samples: Vec<Vec<f32>> = (0..blocks.len())
+        .step_by(3)
+        .map(|i| blocks.block(i).to_vec())
+        .collect();
+    let mut som = SomMatrix::new(16, 16, blocks.dim(), &samples);
+    som.train(&samples, 5, 0.3);
+
+    let cpu = som.quantize_all_flat(&blocks);
+    let weights_flat: Vec<f32> = som.weights.iter().flatten().copied().collect();
+    let gpu_indices = gpu.quantize_flat(&weights_flat, &blocks);
+
+    assert_eq!(gpu_indices.len(), cpu.len());
+    assert!(
+        gpu_indices
+            .iter()
+            .all(|&index| (index as usize) < som.neuron_count())
+    );
+    let differing = cpu
+        .iter()
+        .zip(gpu_indices.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+
+    let psnr_of = |indices: &[u8]| -> f64 {
+        let raw = reconstruct_image_from_codebook(
+            indices,
+            &som.weights,
+            width,
+            height,
+            &block_config,
+        );
+        let recon = Frame::new(
+            RgbImage::from_raw(width, height, raw).expect("recon buffer must fit"),
+            0,
+            0.0,
+        );
+        calculate_psnr(&original, &recon)
+    };
+
+    let psnr_cpu = psnr_of(&cpu);
+    let psnr_gpu = psnr_of(&gpu_indices);
+    println!(
+        "PSNR CPU {psnr_cpu:.4} dB | GPU {psnr_gpu:.4} dB | abweichende Indizes: {differing}/{}",
+        cpu.len()
+    );
+
+    assert!(
+        (psnr_cpu - psnr_gpu).abs() < 1e-3,
+        "PSNR CPU {psnr_cpu:.6} dB vs. GPU {psnr_gpu:.6} dB"
+    );
+}
+
+/// Stream-Rundtrip mit `with_gpu(true)`: Der Encoder rechnet den
+/// Block-Index-Strom auf der GPU; die Indizes muessen fuer die im Paket
+/// uebertragenen Codebooks exakt der CPU-Referenz entsprechen.
+///
+/// Zwei unabhaengig trainierte Streams sind **nicht** vergleichbar
+/// (`SomMatrix::new` initialisiert die Gewichte zufaellig) - deshalb wird
+/// der Vergleich pro Frame gegen den Codebook-Zustand gefuehrt, den auch
+/// der Decoder aus dem Stream rekonstruiert.
+#[test]
+fn gpu_stream_matches_cpu_reference_indices() {
+    let Some(_gpu) = gpu_quantizer_or_skip() else {
+        return;
+    };
+
+    let (width, height) = (64u32, 64u32);
+    let frames: Vec<Frame> = (0..6)
+        .map(|k| {
+            let data: Vec<u8> = (0..(width * height * 3) as usize)
+                .map(|i| {
+                    let base = (i * 13 + (i / 64) * 29) % 256;
+                    ((base + k * 17) % 256) as u8
+                })
+                .collect();
+            Frame::new(
+                RgbImage::from_raw(width, height, data).expect("64x64 frame buffer"),
+                k,
+                k as f64 / 30.0,
+            )
+        })
+        .collect();
+
+    let config = SomVideoConfig::default().with_gpu(true);
+    let result = encode_video_stream(&frames, &config);
+    assert_eq!(result.frames.len(), frames.len());
+    assert!(result.frames[0].is_keyframe);
+
+    // Codebook-Zustand wie der Decoder fortschreiben und die GPU-Indizes
+    // jedes Frames gegen `quantize_all_flat` pruefen.
+    let block_config = BlockConfig::new(config.block_size, 3);
+    let vector_dim = block_config.block_dim();
+    let mut current: Option<SomMatrix> = None;
+
+    for (k, enc) in result.frames.iter().enumerate() {
+        if enc.is_keyframe {
+            let payload = enc
+                .som_matrix
+                .as_ref()
+                .expect("keyframes carry a codebook");
+            current = Some(deserialize_som(
+                payload,
+                config.som_grid_size,
+                config.som_grid_size,
+                vector_dim,
+            ));
+        }
+        let som = current.as_ref().expect("codebook exists after frame 0");
+
+        let blocks = extract_blocks_flat(
+            frames[k].data().as_raw(),
+            frames[k].width(),
+            frames[k].height(),
+            &block_config,
+        );
+        let cpu = som.quantize_all_flat(&blocks);
+        let gpu_indices =
+            decompress_indices(&enc.compressed_indices).expect("indices must decompress");
+
+        let differing = cpu
+            .iter()
+            .zip(gpu_indices.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        println!(
+            "Frame {k} ({}): {differing}/{} Indizes weichen ab | Keyframe {}",
+            if enc.is_keyframe { "Keyframe" } else { "Interframe" },
+            cpu.len(),
+            enc.is_keyframe
+        );
+        assert_eq!(gpu_indices, cpu, "frame {k}: GPU weicht von der CPU-Referenz ab");
+    }
+
+    // Der GPU-Stream muss zusaetzlich gueltig dekodieren.
+    let decoded = decode_video_stream(&result.frames, width, height, &config, 30.0)
+        .expect("decoding must succeed");
+    for (k, (original, decoded_frame)) in frames.iter().zip(decoded.iter()).enumerate() {
+        let psnr = calculate_psnr(original, decoded_frame);
+        println!("Frame {k}: Deko-PSNR {psnr:.4} dB");
+        assert!(psnr > 20.0 || psnr == f64::INFINITY, "frame {k} PSNR {psnr}");
+    }
+}
 
 #[test]
 #[ignore]
@@ -191,4 +422,64 @@ fn bench_som_encode_4k() {
         result.stats.keyframe_count,
         frame_count
     );
+}
+
+/// CPU-vs-GPU-Benchmark der reinen Quantisierung auf 4K-Bloeckmenge
+/// (4096x1152 -> 294.912 Bloecke x 256 Neuronen x 48 Dims).
+///
+/// ```
+/// cargo test --release -- --ignored --nocapture bench_som_quantize_4k_gpu
+/// ```
+#[test]
+#[ignore]
+fn bench_som_quantize_4k_gpu() {
+    let Some(gpu) = gpu_quantizer_or_skip() else {
+        return;
+    };
+
+    let (width, height) = (4096u32, 1152u32);
+    let data: Vec<u8> = (0..(width * height * 3) as usize)
+        .map(|i| ((i * 31 + (i >> 7) * 17) % 251) as u8)
+        .collect();
+
+    let block_config = BlockConfig::new(4, 3);
+    let blocks = extract_blocks_flat(&data, width, height, &block_config);
+
+    let samples: Vec<Vec<f32>> = (0..blocks.len())
+        .step_by(29)
+        .map(|i| blocks.block(i).to_vec())
+        .collect();
+    let mut som = SomMatrix::new(16, 16, blocks.dim(), &samples);
+    som.train(&samples, 1, 0.3);
+    let weights_flat: Vec<f32> = som.weights.iter().flatten().copied().collect();
+
+    // Warmup: Pipeline- und Pufferaufbau nicht in der Messung.
+    let warmup = gpu.quantize_flat(&weights_flat, &blocks);
+    assert_eq!(warmup.len(), blocks.len());
+
+    let start = Instant::now();
+    let cpu_indices = som.quantize_all_flat(&blocks);
+    let d_cpu = start.elapsed();
+
+    let start = Instant::now();
+    let gpu_indices = gpu.quantize_flat(&weights_flat, &blocks);
+    let d_gpu = start.elapsed();
+
+    let differing = cpu_indices
+        .iter()
+        .zip(gpu_indices.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+
+    println!(
+        "quantize {} Bloecke: CPU {:?} | GPU {:?} ({:.1}x)",
+        blocks.len(),
+        d_cpu,
+        d_gpu,
+        d_cpu.as_secs_f64() / d_gpu.as_secs_f64().max(1e-12)
+    );
+    println!("  abweichende Indizes: {differing}/{}", cpu_indices.len());
+
+    assert_eq!(cpu_indices.len(), gpu_indices.len());
+    assert!(gpu_indices.iter().all(|&i| (i as usize) < som.neuron_count()));
 }
