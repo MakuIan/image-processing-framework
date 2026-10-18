@@ -241,3 +241,8 @@ input/*
 !input/.gitkeep
 output/*
 !output/.gitkeep
+
+# Implementation plans (git ignored)
+docs/som_optimization_plan.md
+plans/
+
