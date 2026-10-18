@@ -30,7 +30,8 @@
 //!   die sequentielle SIMD-Aktualisierung den Thread-Synchronisations-Overhead pro Sample,
 //!   sodass das Training extrem schnell im CPU-L1/L2-Cache abläuft.
 
-use rand::{Rng, thread_rng};
+use crate::block::BlockBuffer;
+use rand::{thread_rng, Rng};
 use rayon::prelude::*;
 
 #[cfg(target_arch = "x86_64")]
@@ -131,6 +132,145 @@ mod simd_x86 {
                 best_dist = dist;
                 best_index = i;
             }
+        }
+        best_index
+    }
+
+    /// Wie [`find_bmu_avx2`], aber über einen flachen Gewichtsspeicher mit
+    /// `vector_dim` Stichproben je Neuron (Zeilenmajor).
+    ///
+    /// Die sequenzielle Speicheranordnung erlaubt dem Hardware-Prefetcher,
+    /// die Gewichte als durchgehenden Stream zu laden. Fuer Vielfache von 16
+    /// (der heiße Pfad: 48, 64, 192 ...) werden zudem je zwei Neuronen
+    /// interleaved verarbeitet, damit die FMA-Latenz der beiden unabhaengigen
+    /// Akkumulatoren-Paare versteckt wird. Die Summationsreihenfolge bleibt
+    /// bit-identisch zu [`squared_distance_avx2`] (gleiche even/odd-Gruppierung).
+    #[inline]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    pub unsafe fn find_bmu_flat_avx2(
+        flat_weights: &[f32],
+        vector_dim: usize,
+        sample: &[f32],
+    ) -> usize {
+        debug_assert!(vector_dim > 0 && flat_weights.len().is_multiple_of(vector_dim));
+        debug_assert_eq!(
+            sample.len(),
+            vector_dim,
+            "sample must have exactly vector_dim entries"
+        );
+        let neuron_count = flat_weights.len() / vector_dim;
+        let mut best_index = 0usize;
+        let mut best_dist = f32::INFINITY;
+
+        let mut i = 0usize;
+        if vector_dim.is_multiple_of(16) {
+            let chunk_count = vector_dim / 16;
+            while i + 2 <= neuron_count {
+                let code0 = &flat_weights[i * vector_dim..(i + 1) * vector_dim];
+                let code1 = &flat_weights[(i + 1) * vector_dim..(i + 2) * vector_dim];
+
+                // Genau wie squared_distance_avx2 geht bei jedem 16er-Chunk
+                // die untere Haelfte (8 lanes) in even und die obere in odd;
+                // die Akkumulationsreihenfolge bleibt bit-identisch, waehrend
+                // die zwei Neuronen die FMA-Pipeline fuellen.
+                let mut even0 = _mm256_setzero_ps();
+                let mut odd0 = _mm256_setzero_ps();
+                let mut even1 = _mm256_setzero_ps();
+                let mut odd1 = _mm256_setzero_ps();
+
+                let mut c = 0usize;
+                while c + 1 < chunk_count {
+                    // Chunk c.
+                    let s = unsafe { sample.as_ptr().add(c * 16) };
+                    let vs_low = unsafe { _mm256_loadu_ps(s) };
+                    let vs_high = unsafe { _mm256_loadu_ps(s.add(8)) };
+                    let off = c * 16;
+
+                    let d =
+                        _mm256_sub_ps(vs_low, unsafe { _mm256_loadu_ps(code0.as_ptr().add(off)) });
+                    even0 = _mm256_fmadd_ps(d, d, even0);
+                    let d = _mm256_sub_ps(vs_high, unsafe {
+                        _mm256_loadu_ps(code0.as_ptr().add(off + 8))
+                    });
+                    odd0 = _mm256_fmadd_ps(d, d, odd0);
+                    let d =
+                        _mm256_sub_ps(vs_low, unsafe { _mm256_loadu_ps(code1.as_ptr().add(off)) });
+                    even1 = _mm256_fmadd_ps(d, d, even1);
+                    let d = _mm256_sub_ps(vs_high, unsafe {
+                        _mm256_loadu_ps(code1.as_ptr().add(off + 8))
+                    });
+                    odd1 = _mm256_fmadd_ps(d, d, odd1);
+
+                    // Chunk c+1.
+                    let s = unsafe { sample.as_ptr().add((c + 1) * 16) };
+                    let vs_low = unsafe { _mm256_loadu_ps(s) };
+                    let vs_high = unsafe { _mm256_loadu_ps(s.add(8)) };
+                    let off = (c + 1) * 16;
+
+                    let d =
+                        _mm256_sub_ps(vs_low, unsafe { _mm256_loadu_ps(code0.as_ptr().add(off)) });
+                    even0 = _mm256_fmadd_ps(d, d, even0);
+                    let d = _mm256_sub_ps(vs_high, unsafe {
+                        _mm256_loadu_ps(code0.as_ptr().add(off + 8))
+                    });
+                    odd0 = _mm256_fmadd_ps(d, d, odd0);
+                    let d =
+                        _mm256_sub_ps(vs_low, unsafe { _mm256_loadu_ps(code1.as_ptr().add(off)) });
+                    even1 = _mm256_fmadd_ps(d, d, even1);
+                    let d = _mm256_sub_ps(vs_high, unsafe {
+                        _mm256_loadu_ps(code1.as_ptr().add(off + 8))
+                    });
+                    odd1 = _mm256_fmadd_ps(d, d, odd1);
+
+                    c += 2;
+                }
+                if c < chunk_count {
+                    // Ungerade Chunk-Anzahl: letzter Chunk, gleiches Schema.
+                    let s = unsafe { sample.as_ptr().add(c * 16) };
+                    let vs_low = unsafe { _mm256_loadu_ps(s) };
+                    let vs_high = unsafe { _mm256_loadu_ps(s.add(8)) };
+                    let off = c * 16;
+
+                    let d =
+                        _mm256_sub_ps(vs_low, unsafe { _mm256_loadu_ps(code0.as_ptr().add(off)) });
+                    even0 = _mm256_fmadd_ps(d, d, even0);
+                    let d = _mm256_sub_ps(vs_high, unsafe {
+                        _mm256_loadu_ps(code0.as_ptr().add(off + 8))
+                    });
+                    odd0 = _mm256_fmadd_ps(d, d, odd0);
+                    let d =
+                        _mm256_sub_ps(vs_low, unsafe { _mm256_loadu_ps(code1.as_ptr().add(off)) });
+                    even1 = _mm256_fmadd_ps(d, d, even1);
+                    let d = _mm256_sub_ps(vs_high, unsafe {
+                        _mm256_loadu_ps(code1.as_ptr().add(off + 8))
+                    });
+                    odd1 = _mm256_fmadd_ps(d, d, odd1);
+                }
+
+                let dist0 = unsafe { hsum256_ps(_mm256_add_ps(even0, odd0)) };
+                let dist1 = unsafe { hsum256_ps(_mm256_add_ps(even1, odd1)) };
+                if dist0 < best_dist {
+                    best_dist = dist0;
+                    best_index = i;
+                }
+                if dist1 < best_dist {
+                    best_dist = dist1;
+                    best_index = i + 1;
+                }
+                i += 2;
+            }
+        }
+
+        // Restliche Neuronen (ungerade Anzahl bzw. nicht teilbare Dimension)
+        // ueber den klassischen Einzel-Distanzpfad.
+        while i < neuron_count {
+            let code = &flat_weights[i * vector_dim..(i + 1) * vector_dim];
+            let dist = unsafe { squared_distance_avx2(sample, code) };
+            if dist < best_dist {
+                best_dist = dist;
+                best_index = i;
+            }
+            i += 1;
         }
         best_index
     }
@@ -458,6 +598,47 @@ impl SomMatrix {
         blocks.par_iter().map(|b| self.quantize_block(b)).collect()
     }
 
+    /// Quantisiert alle Blöcke eines flachen [`BlockBuffer`]s (Zero-Allocation
+    /// Pfad): Die BMU-Suche pro Block ist unabhängig und wird parallel mit
+    /// Rayon über die zusammenhängenden Speicherbereiche und pro Block mit
+    /// SIMD ausgeführt; die Reihenfolge bleibt erhalten.
+    ///
+    /// Gegenüber [`SomMatrix::quantize_all`] entfallen die Deref-Sprünge über
+    /// verschachtelte Vektoren und die Längen-Prüfung pro Block (sie erfolgt
+    /// einzig am Puffer). Die Gewichte werden einmalig in einen flachen
+    /// Puffer gespiegelt, damit die BMU-Suche sie als sequenziellen Stream
+    /// laden kann (Prefetcher-freundlich); die Ergebnisse bleiben bit-identisch.
+    ///
+    /// # Panics
+    /// Panics, wenn die Blockdimension des Puffers nicht `vector_dim` ist.
+    pub fn quantize_all_flat(&self, blocks: &BlockBuffer) -> Vec<u8> {
+        let dim = blocks.dim();
+        assert_eq!(
+            dim, self.vector_dim,
+            "block has {dim} sample(s), expected {}",
+            self.vector_dim
+        );
+
+        let data = blocks.data();
+
+        // 256 x 48 f32 = 49 KiB; eine Kopie pro Aufruf (nicht pro Block).
+        let flat_weights: Vec<f32> = self.weights.iter().flatten().copied().collect();
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return data
+                    .par_chunks(dim)
+                    .map(|b| unsafe { simd_x86::find_bmu_flat_avx2(&flat_weights, dim, b) as u8 })
+                    .collect();
+            }
+        }
+
+        data.par_chunks(dim)
+            .map(|b| self.quantize_block(b))
+            .collect()
+    }
+
     /// Liefert den Codevektor (Lookup-Eintrag) am 1D-Index `index`.
     ///
     /// # Panics
@@ -522,6 +703,59 @@ mod tests {
         for (block, code) in blocks.iter().zip(codes.iter()) {
             assert_eq!(som.quantize_block(block), *code);
         }
+    }
+
+    #[test]
+    fn quantize_all_flat_matches_quantize_all() {
+        let som = test_som();
+        let blocks = vec![
+            vec![0.2, 0.2],
+            vec![0.8, 0.2],
+            vec![0.8, 0.8],
+            vec![0.0, 1.0],
+        ];
+
+        let nested = som.quantize_all(&blocks);
+        let flat = BlockBuffer::new(blocks.iter().flatten().copied().collect(), 2);
+
+        assert_eq!(flat.len(), blocks.len());
+        assert_eq!(som.quantize_all_flat(&flat), nested);
+    }
+
+    #[test]
+    fn quantize_all_flat_matches_quantize_block_at_48_dims() {
+        // Uebt den flachen Interleaved-BMU-Pfad (vector_dim % 16 == 0) gegen
+        // den Einzel-Distanzpfad von quantize_block.
+        let dim = 48usize;
+        let samples: Vec<Vec<f32>> = (0..64)
+            .map(|i| {
+                (0..dim)
+                    .map(|j| ((i * 7 + j * 13) % 256) as f32 / 255.0)
+                    .collect()
+            })
+            .collect();
+        let som = SomMatrix::new(16, 16, dim, &samples);
+
+        let blocks = BlockBuffer::new(
+            (0..100 * dim)
+                .map(|i| ((i * 3) % 256) as f32 / 256.0)
+                .collect(),
+            dim,
+        );
+
+        let flat = som.quantize_all_flat(&blocks);
+        assert_eq!(flat.len(), 100);
+        for (k, block) in blocks.blocks().enumerate() {
+            assert_eq!(flat[k], som.quantize_block(block), "block {k}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "block has 4 sample(s), expected 2")]
+    fn quantize_all_flat_rejects_wrong_dim() {
+        let som = test_som();
+        let buffer = BlockBuffer::new(vec![0.0; 8], 4);
+        let _ = som.quantize_all_flat(&buffer);
     }
 
     #[test]

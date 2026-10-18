@@ -129,7 +129,9 @@ cargo run --release -- <INPUT> [OPTIONEN]
 | `--bilateral-radius <INT>` | `3` | Suchradius in Pixeln. |
 | `--bilateral-color <FLOAT>`| `50.0` | Farbtoleranz (σ_color) – Schwellenwert für Kanten. |
 | `--bilateral-space <FLOAT>`| `50.0` | Raumdistanz (σ_space) – räumliche Gewichtung. |
-| `--encoder <NAME>` | `auto` | Video-Encoder für FFmpeg: `auto`, `amf` (AMD), `nvenc` (NVIDIA), `qsv` (Intel), `cpu` (libx264). |
+| `--encoder <NAME>` | `auto` | Video-Encoder für FFmpeg: `auto`, `amf` (AMD), `nvenc` (NVIDIA), `qsv` (Intel), `cpu` (libx265 / libx264). |
+| `--codec <CODEC>` | `h265` | Video-Codec für FFmpeg-Ausgabe: `h265`/`hevc` (Standard) oder `h264`/`avc`. |
+| `--crf <INT>` | `None` (32 bei H.265, 26 bei H.264) | Optionaler Qualitätswert (CRF / CQP) für den Encoder zur Bitraten- und Dateigrößen-Steuerung. |
 | `--max-frames <ANZAHL>` | `None` (alle) | Begrenzt die Frame-Anzahl bei Videos (ideal für Tests). |
 | `-h`, `--help` | - | Zeigt die Hilfe und alle CLI-Parameter an. |
 | `-V`, `--version` | - | Gibt die Versionsnummer des Frameworks aus. |
@@ -146,8 +148,8 @@ cargo run --release -- <INPUT> [OPTIONEN]
 | `--som` | `false` | Aktiviert das neuronale SOM-Kompressionsexperiment für Videos. |
 | `--som-block-size <INT>` | `4` | Kantenlänge quadratischer Kacheln (z. B. `4` für 4x4 oder `8` für 8x8 Pixel). |
 | `--som-grid <INT>` | `16` | Gittergröße des SOM (z. B. `16` für 16x16 = 256 Neuronen, oder `8` für 64 Neuronen). |
-| `--som-threshold <FLOAT>`| `28.0` | PSNR-Schwellenwert in dB. Unterschreitet ein Folgeframe diese Qualität, wird ein neuer Keyframe trainiert. |
-| `--som-epochs <INT>` | `5` | Anzahl der Kohonen-Trainings-Epochen pro Keyframe. |
+| `--som-threshold <FLOAT>`| `28.0` | PSNR-Schwellenwert in dB. Unterschreitet ein Folgeframe diese Qualität, wird ein neuer Keyframe trainiert. Ist die Schwelle für das Material unerreichbar, senkt sie sich automatisch relativ zum letzten Keyframe ab (Toleranz 2.5 dB); `inf` erzwingt jeden Frame als Keyframe. |
+| `--som-epochs <INT>` | `5` | Anzahl der Kohonen-Trainings-Epochen pro Keyframe (mit repräsentativem Subsampling: max. 10.000 Blöcke pro Training). |
 
 ---
 
@@ -159,8 +161,13 @@ cargo run --release -- <INPUT> [OPTIONEN]
    Da Nachbarneuronen ähnliche Bildmuster darstellen, weisen die quantisierten Blockindizes hohe lokale Redundanz auf. Diese wird durch **Run-Length-Encoding (RLE)** und anschließende **Deflate-Kompression (`flate2`)** verlustfrei komprimiert.
 3. **Zeitliche Redundanz & Keyframe-Entscheidung (Inter-Frame):**  
    Frame 0 startet als Keyframe mit neu trainiertem Codebuch. Für jeden Folgeframe wird das bestehende Codebuch getestet:
-   - Erreicht die Rekonstruktion mindestens den Schwellenwert (z. B. `28.0 dB` PSNR), wird das SOM beibehalten und nur der kompakte Index-Datenstrom übertragen.
-   - Sinkt die Qualität (z. B. durch Szenenwechsel oder starke Bewegung), wird ein neuer Keyframe getriggert, ein neues SOM trainiert und die Codebuch-Gewichte übertragen.
+   - Wird die Zielschwellenwert (z. B. `28.0 dB` PSNR) gehalten, wird das SOM beibehalten und nur der kompakte Index-Datenstrom übertragen.
+   - Liegt die Baseline-Qualität des trainierten Codebooks unter der Zielschwelle (typisch bei 4K-Material), senkt sich die effektive Schwelle automatisch auf `Baseline - 2.5 dB`: Keyframes entstehen nur noch bei echtem Qualitätsabfall (Szenenwechsel, starke Bewegung), nicht mehr bei jedem Frame.
+   - Sinkt die Qualität dennoch unter die effektive Schwelle, wird ein neuer Keyframe getriggert, ein neues SOM trainiert und die Codebuch-Gewichte übertragen.
+
+4. **Kompression vs. Export-Video (Wichtige Unterscheidung):**
+   - **Step 2 (Reine SOM-Kompression):** Der neuronale Algorithmus komprimiert die Videodaten in den kompakten SOM-Datenstrom (Codebuch + Indizes + RLE + Deflate). Im Terminal wird in Step 2 sowohl die Ersparnis gegenüber den unkomprimierten RGB-Rohdaten als auch das direkte Verhältnis zur Original-Videodatei (`SOM vs. Original-Container`) ausgegeben.
+   - **Step 3 (Export-Video zur Sichtprüfung):** Die komprimierten Frames werden für den Medienplayer wieder in RGB dekodiert und als H.265/H.264-Video gespeichert. Da quantisierte 4x4-Kacheln scharfe Blockkanten aufweisen, steuert der Parameter `--crf` (Standard: `32` für H.265) die Encoder-Bitrate, um die Dateigröße des Export-Videos kompakt zu halten.
 
 ---
 

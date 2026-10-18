@@ -2,10 +2,10 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use image_processing_framework::{
-    FilterConfig, ImageSink, ImageSource, Pipeline, Sink, SomVideoConfig, Source, VideoEncoder,
-    VideoSink, VideoSource, calculate_psnr, calculate_ssim, create_progress_bar, create_spinner,
-    create_task_progress, decode_video_stream_with_progress, encode_video_stream_with_progress,
-    generate_diff_map,
+    FilterConfig, ImageSink, ImageSource, Pipeline, Sink, SomVideoConfig, Source, VideoCodec,
+    VideoEncoder, VideoSink, VideoSource, calculate_psnr, calculate_ssim, create_progress_bar,
+    create_spinner, create_task_progress, decode_video_stream_with_progress,
+    encode_video_stream_with_progress, generate_diff_map,
 };
 
 // --- Standard-Konstanten fuer Pfade und CLI ---
@@ -16,6 +16,7 @@ const DEFAULT_IMAGE_EXT: &str = "png";
 const PROCESSED_SUFFIX: &str = "_processed";
 const DIFF_HEATMAP_SUFFIX: &str = "_diff_heatmap";
 const DEFAULT_ENCODER: &str = "auto";
+const DEFAULT_CODEC: &str = "h265";
 
 /// Image Processing Framework - Bild- und Video-Verarbeitung ueber die CLI
 #[derive(Parser)]
@@ -68,6 +69,14 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_ENCODER)]
     encoder: String,
 
+    /// Video-Codec fuer FFmpeg (h265/hevc oder h264/avc, Standard: h265)
+    #[arg(long, default_value = DEFAULT_CODEC)]
+    codec: String,
+
+    /// Optionaler CRF/QP-Wert fuer den Video-Encoder (Standard: 32 fuer HEVC, 26 fuer H264)
+    #[arg(long)]
+    crf: Option<u32>,
+
     /// Maximale Anzahl Frames verarbeiten (optional zum Testen)
     #[arg(long)]
     max_frames: Option<usize>,
@@ -89,7 +98,10 @@ struct Cli {
     #[arg(long, default_value_t = 16)]
     som_grid: usize,
 
-    /// PSNR-Schwellenwert in dB fuer Keyframe-Generierung (Standard: 28.0 dB)
+    /// PSNR-Schwellenwert in dB fuer Keyframe-Generierung (Standard: 28.0 dB).
+    /// Ist die Schwelle fuer das Material unerreichbar, senkt sie sich
+    /// automatisch relativ zum letzten Keyframe (minus 2.5 dB Toleranz) ab;
+    /// unendlich erzwingt jeden Frame als Keyframe
     #[arg(long, default_value_t = 28.0)]
     som_threshold: f64,
 
@@ -362,6 +374,10 @@ fn run_som_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         config.som_grid_size * config.som_grid_size
     );
     println!("  PSNR-Schwellenwert:  {:.1} dB", config.psnr_threshold_db);
+    println!(
+        "  Relativer Margin:    {:.1} dB (Keyframe bei PSNR-Abfall zum letzten Keyframe)",
+        config.psnr_relative_margin_db
+    );
     println!("  Kohonen-Epochen:     {}", config.train_epochs);
 
     println!("\nStep 1: Frames aus Video laden...");
@@ -413,30 +429,45 @@ fn run_som_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     pb_encode.finish_and_clear();
 
     println!("\n=== Kompressions- & Qualitaets-Statistik ===");
-    println!("  Verarbeitete Frames:      {}", result.stats.total_frames);
+    println!("  Verarbeitete Frames:         {}", result.stats.total_frames);
     println!(
-        "  Keyframes generiert:      {} ({:.1}% aller Frames)",
+        "  Keyframes generiert:         {} ({:.1}% aller Frames)",
         result.stats.keyframe_count,
         (result.stats.keyframe_count as f64 / result.stats.total_frames as f64) * 100.0
     );
     println!(
-        "  Durchschnittliche PSNR:   {:.2} dB",
+        "  Durchschnittliche PSNR:      {:.2} dB",
         result.stats.avg_psnr_db
     );
     println!(
-        "  Rohdaten-Groesse:          {:.2} MB ({} Bytes)",
+        "  Unkomprimiert (RGB-Rohdaten):{:.2} MB ({} Bytes)",
         result.stats.raw_size as f64 / 1_048_576.0,
         result.stats.raw_size
     );
     println!(
-        "  Komprimierte Index-Groesse:{:.2} KB ({} Bytes)",
-        result.stats.compressed_size as f64 / 1_024.0,
+        "  SOM-Datenstrom (Index+SOM):  {:.2} MB ({} Bytes)",
+        result.stats.compressed_size as f64 / 1_048_576.0,
         result.stats.compressed_size
     );
     println!(
-        "  Kompressionsfaktor (CR):  {:.2} : 1",
+        "  CR gegenueber Rohdaten:      {:.2} : 1",
         result.stats.compression_ratio
     );
+    if let Ok(meta) = std::fs::metadata(input_path) {
+        let input_bytes = meta.len();
+        println!(
+            "  Original-Videodatei (Input): {:.2} MB ({} Bytes)",
+            input_bytes as f64 / 1_048_576.0,
+            input_bytes
+        );
+        let ratio_to_orig = input_bytes as f64 / result.stats.compressed_size as f64;
+        let pct_of_orig = (result.stats.compressed_size as f64 / input_bytes as f64) * 100.0;
+        println!(
+            "  SOM vs. Original-Container:  {:.2} : 1 ({:.1}% der Original-Dateigroesse)",
+            ratio_to_orig,
+            pct_of_orig
+        );
+    }
 
     println!("\nStep 3: Dekodiere Videostrom & schreibe Ausgabevideo zur Qualitaetspruefung...");
     let pb_decode = create_progress_bar(result.frames.len() as u64, "Dekodiere Frames");
@@ -466,7 +497,14 @@ fn run_som_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // Ausgabe-Video via FFmpeg schreiben
     let encoder = VideoEncoder::from_str_loose(&cli.encoder);
-    let mut sink = VideoSink::new(&output_path, fps as f32).with_encoder(encoder);
+    let codec = VideoCodec::from_str_loose(&cli.codec);
+    let mut sink = VideoSink::new(&output_path, fps as f32)
+        .with_encoder(encoder)
+        .with_codec(codec);
+    if let Some(crf) = cli.crf {
+        sink.set_crf(Some(crf));
+    }
+
     let pb_write = create_progress_bar(decoded_frames.len() as u64, "Schreibe Video (FFmpeg)");
     for frame in &decoded_frames {
         sink.write(frame)?;
@@ -477,11 +515,22 @@ fn run_som_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     if output_path.is_file() {
         let meta = std::fs::metadata(&output_path)?;
+        let out_bytes = meta.len();
         println!(
-            "  Rekonstruiertes Video:    {:?} ({} Bytes)",
+            "  Rekonstruiertes Video:       {:?} ({:.2} MB, {} Bytes)",
             output_path,
-            meta.len()
+            out_bytes as f64 / 1_048_576.0,
+            out_bytes
         );
+        if let Ok(in_meta) = std::fs::metadata(input_path) {
+            let in_bytes = in_meta.len();
+            let ratio = in_bytes as f64 / out_bytes as f64;
+            println!(
+                "  Verhaeltnis Export / Input:  {:.1}% ({:.2} : 1)",
+                (out_bytes as f64 / in_bytes as f64) * 100.0,
+                ratio
+            );
+        }
     }
 
     println!("\n=== SOM-Kompression erfolgreich abgeschlossen ===");
@@ -524,7 +573,13 @@ fn run_video_pipeline(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let encoder = VideoEncoder::from_str_loose(&cli.encoder);
-    let mut sink = VideoSink::new(&output_path, source.fps() as f32).with_encoder(encoder);
+    let codec = VideoCodec::from_str_loose(&cli.codec);
+    let mut sink = VideoSink::new(&output_path, source.fps() as f32)
+        .with_encoder(encoder)
+        .with_codec(codec);
+    if let Some(crf) = cli.crf {
+        sink.set_crf(Some(crf));
+    }
 
     println!("\nStep 2: Pipeline aufbauen...");
     let mut pipeline = build_pipeline(cli);

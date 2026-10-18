@@ -1,4 +1,4 @@
-﻿//! SOM-gestÃ¼tzte Video-Kompression.
+//! SOM-gestÃ¼tzte Video-Kompression.
 //!
 //! Das Frame-Stream-Codec quantisiert 4x4-RGB-BildblÃ¶cke mit einer
 //! Self-Organizing Map (SOM) auf Indizes `0..=255` und Ã¼bertrÃ¤gt pro Frame
@@ -10,19 +10,30 @@
 //!    Das Paket enthÃ¤lt die SOM-Gewichte plus die komprimierten Indizes.
 //!
 //! 2. **Frame k > 0**: Die BlÃ¶cke werden mit der *bisherigen* SOM
-//!    enkodiert und der Frame testweise rekonstruiert. Ist die PSNR
-//!    gegenÃ¼ber dem Original mindestens `psnr_threshold_db`, ist der
+//!    enkodiert und der Frame testweise rekonstruiert. Liegt die PSNR
+//!    mindestens Ã¼ber dem effektiven Schwellenwert, ist der
 //!    Codebook-Zustand weiterhin gÃ¼ltig: Es wird kein Keyframe erzeugt und
 //!    nur das Index-Paket gesendet. Liegt die PSNR darunter, wird auf den
 //!    BlÃ¶cken von Frame k ein neues SOM trainiert, Frame k wird damit als
 //!    Keyframe erneut enkodiert und das Paket enthÃ¤lt die neuen
 //!    SOM-Gewichte plus die komprimierten Indizes.
 //!
+//! Der effektive Schwellenwert ist **adaptiv** (relativ zum aktuellen
+//! Codebook): Ist `psnr_threshold_db` fÃ¼r das Material unerreichbar (die
+//! Baseline-PSNR, also die QualitÃ¤t, die das trainierte Codebook beim
+//! Keyframe liefert, liegt darunter), wird die Schwelle auf
+//! `baseline - psnr_relative_margin_db` abgesenkt. Nur bei echtem
+//! QualitÃ¤tsabfall gegenÃ¼ber dem Keyframe wird neu trainiert; ein
+//! `psnr_threshold_db == f64::INFINITY` erzwingt weiterhin jeden Frame als
+//! Keyframe.
+//!
 //! Der Decoder arbeitet damit sequenziell: Er hÃ¤lt die zuletzt empfangene
 //! SOM, liest bei jedem Frame die Indizes, und Ã¼bernimmt bei Keyframes
 //! zusÃ¤tzlich die neuen SOM-Gewichte, bevor die BlÃ¶cke rekonstruiert werden.
 
-use crate::block::{BlockConfig, extract_blocks, reconstruct_image};
+use crate::block::{
+    BlockBuffer, BlockConfig, extract_blocks_flat, reconstruct_image_from_codebook,
+};
 use crate::compression::{compress_indices, decompress_indices};
 use crate::evaluator::calculate_psnr;
 use crate::frame::Frame;
@@ -33,6 +44,18 @@ use image::RgbImage;
 /// [`SomMatrix::train`]).
 const INITIAL_LEARNING_RATE: f32 = 0.3;
 
+/// Maximale Anzahl an BlÃ¶cken, die pro Keyframe fÃ¼r das SOM-Training
+/// verwendet werden (reprÃ¤sentatives Subsampling). FÃ¼r ein 16x16-Gitter
+/// (256 Neuronen) genÃ¼gen 5.000-10.000 BlÃ¶cke, um Farb- und
+/// Texturverteilung eines Frames statistisch abzubilden; grÃ¶ÃŸere Frames
+/// werden strided gesampelt.
+const MAX_TRAINING_SAMPLES: usize = 10_000;
+
+/// StandardmÃ¤ÃŸiger Toleranzband fÃ¼r die relative Keyframe-Erkennung:
+/// Wird die PSNR gegenÃ¼ber dem letzten Keyframe um mehr als diese Menge
+/// (dB) fÃ¤llt, entsteht ein neuer Keyframe.
+const DEFAULT_PSNR_RELATIVE_MARGIN_DB: f64 = 2.5;
+
 /// Parameter des SOM-Video-Codecs.
 #[derive(Clone, Debug)]
 pub struct SomVideoConfig {
@@ -41,9 +64,17 @@ pub struct SomVideoConfig {
     /// Gitterseite des SOM: `som_grid_size x som_grid_size` Neuronen
     /// (Standard: `16` -> 256 Codevektoren).
     pub som_grid_size: usize,
-    /// Mindest-PSNR in dB, unterhalb derer ein Frame als Keyframe neu
-    /// trainiert wird (Standard: `28.0`).
+    /// Zielschwellenwert in dB, unterhalb derer ein Frame als Keyframe neu
+    /// trainiert wird (Standard: `28.0`). Ist der Wert fÃ¼r das Material
+    /// unerreichbar (Baseline-PSNR des aktuellen Codebooks darunter),
+    /// senkt sich die effektive Schwelle automatisch auf
+    /// `baseline - psnr_relative_margin_db` ab. `f64::INFINITY` erzwingt
+    /// jeden Frame als Keyframe.
     pub psnr_threshold_db: f64,
+    /// Toleranzband der relativen Keyframe-Erkennung in dB
+    /// (Standard: `2.5`): Keyframe bei PSNR-Abfall gegenÃ¼ber dem letzten
+    /// Keyframe um mehr als diesen Wert.
+    pub psnr_relative_margin_db: f64,
     /// Anzahl der Kohonen-Epochen beim Training (Standard: `5`).
     pub train_epochs: usize,
 }
@@ -54,6 +85,7 @@ impl Default for SomVideoConfig {
             block_size: 4,
             som_grid_size: 16,
             psnr_threshold_db: 28.0,
+            psnr_relative_margin_db: DEFAULT_PSNR_RELATIVE_MARGIN_DB,
             train_epochs: 5,
         }
     }
@@ -71,8 +103,15 @@ impl SomVideoConfig {
             block_size,
             som_grid_size,
             psnr_threshold_db,
+            psnr_relative_margin_db: DEFAULT_PSNR_RELATIVE_MARGIN_DB,
             train_epochs,
         }
+    }
+
+    /// Setzt das Toleranzband der relativen Keyframe-Erkennung (dB).
+    pub fn with_psnr_relative_margin(mut self, margin_db: f64) -> Self {
+        self.psnr_relative_margin_db = margin_db;
+        self
     }
 }
 
@@ -168,9 +207,9 @@ pub fn deserialize_som(
     }
 }
 
-/// Wandelt ein RGB-Frame in den rohen Byte-Puffer
-/// (`width * height * 3`, Zeilenweise) um.
-fn frame_to_raw(frame: &Frame) -> Vec<u8> {
+/// Liefert den rohen Byte-Puffer eines Frames (`width * height * 3`,
+/// zeilenweise) als Referenz, ohne eine Kopie anzulegen.
+fn frame_pixels(frame: &Frame) -> &[u8] {
     let raw = frame.data().as_raw();
     let expected = (frame.width() as usize) * (frame.height() as usize) * 3;
     assert_eq!(
@@ -181,17 +220,30 @@ fn frame_to_raw(frame: &Frame) -> Vec<u8> {
         frame.width(),
         frame.height()
     );
-    raw.to_vec()
+    raw.as_slice()
 }
 
-/// Trainiert auf den BlÃ¶cken von `frame` eine neue SOM gemÃ¤ÃŸ `config`.
-fn train_som_on_frame(
-    frame: &Frame,
+/// Repraesentatives Subsampling (Stufe 2): Waehlt per Strided-Sampling
+/// hoechstens [`MAX_TRAINING_SAMPLES`] gleichmaessig verteilte Bloecke aus,
+/// statt den ganzen Frame zu trainieren.
+fn subsample_for_training(blocks: &BlockBuffer) -> Vec<Vec<f32>> {
+    let stride = (blocks.len() / MAX_TRAINING_SAMPLES).max(1);
+    (0..blocks.len())
+        .step_by(stride)
+        .map(|index| blocks.block(index).to_vec())
+        .collect()
+}
+
+/// Trainiert auf einer repraesentativen Stichprobe von `blocks` eine neue SOM.
+///
+/// # Panics
+/// Panics, wenn `blocks` leer ist (Frame kleiner als ein Block).
+fn train_som_on_blocks(
+    blocks: &BlockBuffer,
     config: &BlockConfig,
     som_grid: usize,
     epochs: usize,
 ) -> SomMatrix {
-    let blocks = extract_blocks(&frame_to_raw(frame), frame.width(), frame.height(), config);
     assert!(
         !blocks.is_empty(),
         "frame is smaller than one {}x{} block, nothing to train on",
@@ -199,33 +251,49 @@ fn train_som_on_frame(
         config.block_size
     );
 
-    let mut som = SomMatrix::new(som_grid, som_grid, config.block_dim(), &blocks);
-    som.train(&blocks, epochs, INITIAL_LEARNING_RATE);
+    let samples = subsample_for_training(blocks);
+    let mut som = SomMatrix::new(som_grid, som_grid, config.block_dim(), &samples);
+    som.train(&samples, epochs, INITIAL_LEARNING_RATE);
     som
 }
 
-/// Einkodiert die BlÃ¶cke von `frame` mit `som` und liefert das
-/// RLE+Deflate-Paket der Indizes.
-fn encode_frame_indices(frame: &Frame, som: &SomMatrix, config: &BlockConfig) -> Vec<u8> {
-    let blocks = extract_blocks(&frame_to_raw(frame), frame.width(), frame.height(), config);
-    let indices = som.quantize_all(&blocks);
-    compress_indices(&indices)
+/// Rekonstruiert den Frame, der ueber `indices` aus `som` entsteht, und
+/// liefert die PSNR gegenueber dem Original.
+///
+/// Die Indizes werden wiederverwendet (kein erneutes Quantisieren) und die
+/// Codevektoren direkt ins Bild geschrieben (kein `Vec<Vec<f32>>`-Zwischenpuffer).
+fn psnr_from_indices(frame: &Frame, som: &SomMatrix, indices: &[u8], config: &BlockConfig) -> f64 {
+    let recon_raw = reconstruct_image_from_codebook(
+        indices,
+        &som.weights,
+        frame.width(),
+        frame.height(),
+        config,
+    );
+    let image = RgbImage::from_raw(frame.width(), frame.height(), recon_raw)
+        .expect("reconstructed image buffer must match dimensions");
+    calculate_psnr(frame, &Frame::new(image, frame.index(), frame.timestamp()))
 }
 
-/// Rekonstruiert `frame` testweise Ã¼ber die Indizes der SOM `som`:
-/// BlÃ¶cke extrahieren, quantisieren, Codevektoren in ein Frame zerlegen.
-fn reconstruct_frame_with_som(frame: &Frame, som: &SomMatrix, config: &BlockConfig) -> Frame {
-    let blocks = extract_blocks(&frame_to_raw(frame), frame.width(), frame.height(), config);
-    let indices = som.quantize_all(&blocks);
-
-    let recon_blocks: Vec<Vec<f32>> = indices
-        .iter()
-        .map(|&i| som.lookup_vector(i).to_vec())
-        .collect();
-    let recon_raw = reconstruct_image(&recon_blocks, frame.width(), frame.height(), config);
-
-    let image = RgbImage::from_raw(frame.width(), frame.height(), recon_raw);
-    frame.clone_with_data(image.expect("reconstructed image buffer must match dimensions"))
+/// Effektiver Keyframe-Schwellenwert (Stufe 3, dynamisch/relativ):
+///
+/// * `psnr_threshold_db == +/- f64::INFINITY` ist ein Sentry: Die absolute
+///   Schwelle gilt unveraendert (unendlich -> jeder Frame wird Keyframe,
+///   minus unendlich -> nie).
+/// * Liegt die Baseline-PSNR (Qualitaet des aktuellen Codebooks beim
+///   Keyframe) **unter** der Zielschwelle, ist das Ziel fuer dieses Material
+///   unerreichbar; dann wird auf `baseline - margin` abgesenkt, sodass nur
+///   bei echtem Qualitaetsabfall neu trainiert wird.
+/// * Sonst gilt die Zielschwelle unveraendert.
+fn effective_threshold(absolute: f64, baseline: f64, margin: f64) -> f64 {
+    if absolute.is_infinite() {
+        return absolute;
+    }
+    if baseline < absolute {
+        baseline - margin
+    } else {
+        absolute
+    }
 }
 
 /// Einkodiert einen Frame-Stream gemÃ¤ÃŸ `config`.
@@ -284,13 +352,12 @@ pub fn encode_video_stream_with_progress<F: FnMut(EncodeFrameProgress)>(
 
     let block_config = BlockConfig::new(config.block_size, 3);
 
-    // Frame 0: immer Keyframe, neues SOM trainieren.
-    let mut som = train_som_on_frame(
-        &frames[0],
-        &block_config,
-        config.som_grid_size,
-        config.train_epochs,
-    );
+    // Codebook-Zustand: existiert erst ab dem ersten Keyframe (Frame 0).
+    // `baseline_psnr` merkt sich die Qualitaet, die das aktuelle Codebook
+    // beim Trainieren des letzten Keyframes geliefert hat; sie ist die
+    // Grundlage der adaptiven Keyframe-Erkennung (Stufe 3).
+    let mut som: Option<SomMatrix> = None;
+    let mut baseline_psnr = 0.0_f64;
 
     let mut frames_out: Vec<EncodedFrame> = Vec::with_capacity(frames.len());
     let mut keyframe_count = 0usize;
@@ -300,39 +367,73 @@ pub fn encode_video_stream_with_progress<F: FnMut(EncodeFrameProgress)>(
     let mut compressed_size: u64 = 0;
 
     for (k, frame) in frames.iter().enumerate() {
-        // Testweise Rekonstruktion mit der bisherigen SOM (Frame 0 nutzt
-        // das soeben auf ihm selbst trainierte SOM).
-        let mut recon = reconstruct_frame_with_som(frame, &som, &block_config);
-        let mut frame_psnr = calculate_psnr(frame, &recon);
+        // Stufe 1: Block-Extraktion genau einmal pro Frame - flach und ohne
+        // Frame-Kopie. Test-Rekonstruktion, Quantisierung und Index-Paket
+        // teilen sich diesen Puffer und die bereits berechneten Indizes.
+        let pixels = frame_pixels(frame);
+        let blocks = extract_blocks_flat(pixels, frame.width(), frame.height(), &block_config);
 
-        let is_keyframe = if k == 0 {
-            // Neues SOM auf Frame 0: Paket enthaelt Gewichte + Indizes.
-            true
-        } else if frame_psnr < config.psnr_threshold_db {
-            // Codebook passt nicht mehr: neues SOM trainieren, neu kodieren.
-            som = train_som_on_frame(
-                frame,
+        let mut is_keyframe = som.is_none();
+        let mut indices;
+        let mut frame_psnr;
+
+        if is_keyframe {
+            // Kein Codebook vorhanden (Frame 0) bzw. soeben erneuert:
+            // SOM trainieren, Indizes und PSNR damit bestimmen.
+            let trained = train_som_on_blocks(
+                &blocks,
                 &block_config,
                 config.som_grid_size,
                 config.train_epochs,
             );
-            recon = reconstruct_frame_with_som(frame, &som, &block_config);
-            frame_psnr = calculate_psnr(frame, &recon);
-            true
+            indices = trained.quantize_all_flat(&blocks);
+            frame_psnr = psnr_from_indices(frame, &trained, &indices, &block_config);
+            baseline_psnr = frame_psnr;
+            som = Some(trained);
         } else {
-            false
-        };
+            // Testweise Rekonstruktion mit der bisherigen SOM.
+            let current = som.as_ref().expect("codebook exists after frame 0");
+            indices = current.quantize_all_flat(&blocks);
+            frame_psnr = psnr_from_indices(frame, current, &indices, &block_config);
+
+            let threshold = effective_threshold(
+                config.psnr_threshold_db,
+                baseline_psnr,
+                config.psnr_relative_margin_db,
+            );
+            if frame_psnr < threshold {
+                // Codebook passt nicht mehr: neues SOM trainieren, neu kodieren.
+                // Die Indizes muessen mit dem neuen Codebook neu berechnet
+                // werden; das Ergebnis geht anschliessend direkt als Paket
+                // ueber (kein weiterer Quantisierungslauf).
+                is_keyframe = true;
+                let trained = train_som_on_blocks(
+                    &blocks,
+                    &block_config,
+                    config.som_grid_size,
+                    config.train_epochs,
+                );
+                indices = trained.quantize_all_flat(&blocks);
+                frame_psnr = psnr_from_indices(frame, &trained, &indices, &block_config);
+                baseline_psnr = frame_psnr;
+                som = Some(trained);
+            }
+        }
         if is_keyframe {
             keyframe_count += 1;
         }
 
-        let compressed_indices = encode_frame_indices(frame, &som, &block_config);
+        // Wiederverwendung der bereits berechneten Indizes (Stufe 1):
+        // kein zweites `quantize_all` fuer das Paket.
+        let compressed_indices = compress_indices(&indices);
         let compressed_len = compressed_indices.len() as u64;
 
         frames_out.push(EncodedFrame {
             is_keyframe,
             som_matrix: if is_keyframe {
-                Some(serialize_som(&som))
+                Some(serialize_som(
+                    som.as_ref().expect("keyframes carry a codebook"),
+                ))
             } else {
                 None
             },
@@ -425,12 +526,10 @@ pub fn decode_video_stream_with_progress<F: FnMut(usize, usize)>(
             .ok_or_else(|| format!("Frame {k} empfangen, bevor ein initiales SOM gesetzt wurde"))?;
 
         let indices = decompress_indices(&enc.compressed_indices)?;
-        let recon_blocks: Vec<Vec<f32>> = indices
-            .iter()
-            .map(|&idx| som.lookup_vector(idx).to_vec())
-            .collect();
-
-        let recon_raw = reconstruct_image(&recon_blocks, width, height, &block_config);
+        // Direkte Rekonstruktion aus Indizes + Codebook: keine
+        // `Vec<Vec<f32>>`-Zwischenpuffer pro Frame (Stufe 4).
+        let recon_raw =
+            reconstruct_image_from_codebook(&indices, &som.weights, width, height, &block_config);
         let image = RgbImage::from_raw(width, height, recon_raw)
             .ok_or_else(|| "Ungueltige Dimensionen fuer rekonstruiertes Bild".to_string())?;
 
@@ -456,6 +555,7 @@ pub fn decode_video_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::extract_blocks;
 
     /// Erzeugt ein Frame mit einheitlicher Farbe.
     fn make_solid_frame(index: usize, val: u8) -> Frame {
@@ -509,7 +609,7 @@ mod tests {
         let frame = make_frame(0, 0);
         let block_config = BlockConfig::new(4, 3);
         let blocks = extract_blocks(
-            &frame_to_raw(&frame),
+            frame_pixels(&frame),
             frame.width(),
             frame.height(),
             &block_config,
@@ -590,6 +690,69 @@ mod tests {
                 .iter()
                 .all(|f| f.is_keyframe && f.som_matrix.is_some())
         );
+    }
+
+    #[test]
+    fn adaptive_threshold_keeps_interframes_below_unreachable_absolute() {
+        // Mit dem starren absoluten Vergleich wuerde eine unerreichbar hohe
+        // Zielschwelle (1000 dB) jeden Frame zum Keyframe machen. Die adaptive
+        // Erkennung senkt die effektive Schwelle auf die Baseline des
+        // Keyframes (minus Margin): identische Folgeframes bleiben Interframes.
+        let frames = vec![make_frame(0, 0), make_frame(1, 0), make_frame(2, 0)];
+        let config = SomVideoConfig {
+            psnr_threshold_db: 1000.0,
+            ..default_config()
+        };
+
+        let result = encode_video_stream(&frames, &config);
+        assert_eq!(result.stats.keyframe_count, 1);
+        assert!(result.frames[0].is_keyframe);
+        assert!(!result.frames[1].is_keyframe);
+        assert!(!result.frames[2].is_keyframe);
+    }
+
+    #[test]
+    fn adaptive_threshold_still_detects_content_changes() {
+        // Grosser Inhaltswechsel: Die PSNR faellt weit unter
+        // `baseline - margin`, also entsteht weiterhin ein Keyframe.
+        let frames = vec![make_frame(0, 0), make_frame(1, 120)];
+        let result = encode_video_stream(&frames, &default_config());
+
+        assert!(result.frames[1].is_keyframe, "scene change must retrain");
+        assert_eq!(result.stats.keyframe_count, 2);
+    }
+
+    #[test]
+    fn effective_threshold_follows_plan_examples() {
+        // Zielschwelle erreichbar -> absoluter Wert gilt.
+        assert_eq!(effective_threshold(28.0, 30.0, 2.5), 28.0);
+        // Ziel unerreichbar (Plan: 23.8 dB Baseline - 2.5 dB Margin = 21.3 dB).
+        let lowered = effective_threshold(28.0, 23.8, 2.5);
+        assert!((lowered - 21.3).abs() < 1e-9, "got {lowered}");
+        // INFINITY-Sentry: unveraendert -> jeder Frame wird Keyframe.
+        assert_eq!(effective_threshold(f64::INFINITY, 23.8, 2.5), f64::INFINITY);
+        assert_eq!(effective_threshold(20.0, 40.0, 2.5), 20.0);
+    }
+
+    #[test]
+    fn training_subsample_caps_block_count() {
+        let block_config = BlockConfig::new(4, 3);
+
+        // 800x800 -> 200 * 200 = 40.000 Bloecke; Stride 4 -> 10.000 Samples.
+        let data = vec![0u8; 800 * 800 * 3];
+        let blocks = extract_blocks_flat(&data, 800, 800, &block_config);
+        assert_eq!(blocks.len(), 40_000);
+
+        let samples = subsample_for_training(&blocks);
+        assert_eq!(samples.len(), MAX_TRAINING_SAMPLES);
+        // Gleichmaessiges Strided-Sampling: das zweite Sample ist Block `stride`.
+        let stride = 40_000 / MAX_TRAINING_SAMPLES;
+        assert_eq!(samples[1], blocks.block(stride).to_vec());
+
+        // Kleine Frames werden vollstaendig verwendet (Stride 1).
+        let small = extract_blocks_flat(&data[..16 * 16 * 3], 16, 16, &block_config);
+        assert_eq!(small.len(), 16);
+        assert_eq!(subsample_for_training(&small).len(), 16);
     }
 
     #[test]
