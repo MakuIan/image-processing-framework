@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use image_processing_framework::{
+use image_video_processing_framework::{
     FilterConfig, ImageSink, ImageSource, Pipeline, Sink, SomVideoConfig, Source, VideoCodec,
     VideoEncoder, VideoSink, VideoSource, calculate_psnr, calculate_ssim, create_progress_bar,
     create_spinner, create_task_progress, decode_video_stream_with_progress,

@@ -1,5 +1,5 @@
 use image::RgbImage;
-use image_processing_framework::{
+use image_video_processing_framework::{
     BlockBuffer, BlockConfig, Frame, SomGpuQuantizer, SomMatrix, SomVideoConfig, calculate_psnr,
     compress_indices, decode_video_stream, decompress_indices, deserialize_som,
     encode_video_stream, encode_video_stream_with_progress, extract_blocks_flat,

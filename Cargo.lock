@@ -806,7 +806,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "image-processing-framework"
+name = "image-video-processing-framework"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
